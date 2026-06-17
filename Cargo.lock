@@ -1202,6 +1202,18 @@ name = "arb-math"
 version = "0.1.4"
 
 [[package]]
+name = "arb-mel"
+version = "0.1.4"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "arb-primitives",
+ "arb-storage-errors",
+ "arbos",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "arb-node"
 version = "0.1.4"
 dependencies = [
