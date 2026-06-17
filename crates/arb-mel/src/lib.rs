@@ -3,8 +3,6 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
-use std::sync::Arc;
-
 use alloy_consensus::{Header, Transaction};
 use alloy_primitives::{Address, B256, Log, keccak256};
 use arbos::arbos_types::MessageWithMetadata;
@@ -34,6 +32,7 @@ pub struct MelState {
     pub batch_count: u64,
     pub msg_count: u64,
     pub delayed_messages_seen: u64,
+    pub delayed_messages_read: u64,
     pub delayed_message_posting_target_address: Address,
     pub batch_posting_target_address: Address,
     pub version: u16,
@@ -77,6 +76,7 @@ pub struct ExtractionOutput {
 
 pub struct Batch {
     pub sequence_number: u64,
+    pub after_delayed_count: u64,
 }
 
 pub struct BatchMeta {
@@ -126,14 +126,14 @@ where
     let mut batch_post_report_idx: usize = 0;
     let mut batch_post_report_batch_hash = B256::ZERO;
     let mut messages: Vec<MessageWithMetadata> = Vec::new();
-    let mut serialized_batches: Vec<&[u8]> = Vec::new();
+    let mut serialized_batches: Vec<Vec<u8>> = Vec::new();
     for (i, batch) in batches.iter().enumerate() {
         let serialized = serialize_batch(batch, logs_fetcher)?;
         if batch_post_report_idx < batch_posting_reports.len() {
             let report = batch_posting_reports[batch_post_report_idx];
             if batch_post_report_batch_hash == B256::ZERO {
             }
-            let got_hash = keccak256(serialized);
+            let got_hash = keccak256(&serialized);
             if got_hash == batch_post_report_batch_hash {
                 // Fill in the gas stats.
                 // Process next report.
@@ -141,7 +141,7 @@ where
                 batch_post_report_batch_hash = B256::ZERO;
             }
         }
-        serialized_batches.push(serialized.as_slice());
+        serialized_batches.push(serialized);
     }
 
     if batch_posting_reports.len() != batch_post_report_idx {
@@ -171,12 +171,12 @@ where
             //     expected_batch_seq_num, batch.sequence_number
             // ))));
         }
-        let serialized = serialized_batches[i];
+        let serialized = &serialized_batches[i];
         let raw_seq_msg = parse_sequencer_message()?;
         let messages_in_batch = extract_batch_messages()?;
-        for msg in messages_in_batch.iter() {
+        for msg in messages_in_batch.into_iter() {
+            post_state.accumulate_message(&msg)?;
             messages.push(msg);
-            post_state.accumulate_message(msg)?;
             post_state.msg_count += 1;
         }
         post_state.batch_count += 1;
