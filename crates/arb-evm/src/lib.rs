@@ -15,12 +15,14 @@ pub mod hooks;
 pub mod multi_gas;
 pub mod receipt;
 pub mod sequencer;
+pub mod simulation;
 pub mod state_overlay;
 pub mod transaction;
 
 pub use assembler::ArbBlockAssembler;
 pub use build::{
-    ArbBlockExecutor, ArbBlockExecutorFactory, ArbScheduledTxDrain, ArbTransactionEnv,
+    ArbBlockExecutor, ArbBlockExecutorFactory, ArbScheduledTxDrain, ArbSimulationProgress,
+    ArbTransactionEnv,
 };
 pub use config::ArbEvmConfig;
 pub use context::{
@@ -34,5 +36,9 @@ pub use receipt::ArbReceiptBuilder;
 pub use sequencer::{
     execute_sequencer_block, ExecutedSequencerBlock, SequencerBlockInput, SequencerBlockState,
     SequencerTransactionExecution,
+};
+pub use simulation::{
+    execute_simulated_transaction, execute_simulated_transaction_with_inspector,
+    ArbSimulationError, ArbSimulationOutput, ArbSimulationTransaction,
 };
 pub use transaction::ArbTransaction;

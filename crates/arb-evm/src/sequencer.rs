@@ -38,7 +38,7 @@ use reth_revm::{
     Database, DatabaseRef,
 };
 
-use crate::{config::ArbEvmConfig, multi_gas};
+use crate::{config::ArbEvmConfig, multi_gas, ArbSimulationProgress};
 
 /// Parent/result metadata needed to execute the next sequencer message.
 ///
@@ -109,6 +109,10 @@ pub struct ExecutedSequencerBlock {
     pub user_executions: Vec<SequencerTransactionExecution>,
     pub receipts: Vec<ArbReceipt>,
     pub gas_used: u64,
+    /// Remaining per-block gas and user-transaction count after the complete
+    /// sequencer message. Speculative transactions appended by a low-latency
+    /// consumer must resume these counters rather than starting a fresh block.
+    pub simulation_progress: ArbSimulationProgress,
     pub skipped: Vec<SkippedSequencerTransaction>,
 }
 
@@ -356,6 +360,7 @@ where
         }
     }
 
+    let simulation_progress = executor.simulation_progress();
     let zombie_accounts = executor.zombie_accounts();
     let finalise_deleted = executor.finalise_deleted().clone();
     let (_, execution_result) = executor
@@ -406,6 +411,7 @@ where
         user_executions,
         receipts: execution_result.receipts,
         gas_used: execution_result.gas_used,
+        simulation_progress,
         skipped,
     })
 }
@@ -496,7 +502,7 @@ fn drain_scheduled<E>(
     }
 }
 
-fn augment_bundle_from_cache<DB>(
+pub(crate) fn augment_bundle_from_cache<DB>(
     bundle: &mut BundleState,
     cache: &reth_revm::db::CacheState,
     database: &DB,
@@ -577,7 +583,7 @@ where
     Ok(())
 }
 
-fn apply_account_deletions<DB>(
+pub(crate) fn apply_account_deletions<DB>(
     bundle: &mut BundleState,
     zombie_accounts: &rustc_hash::FxHashSet<Address>,
     finalise_deleted: &rustc_hash::FxHashSet<Address>,
@@ -653,7 +659,7 @@ where
     Ok(())
 }
 
-fn filter_unchanged_storage(bundle: &mut BundleState) {
+pub(crate) fn filter_unchanged_storage(bundle: &mut BundleState) {
     for account in bundle.state.values_mut() {
         account
             .storage

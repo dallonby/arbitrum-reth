@@ -356,6 +356,17 @@ pub struct ArbBlockExecutor<'a, Evm, Spec, R: ReceiptBuilder> {
     multi_gas_sink: crate::multi_gas::MultiGasSink,
 }
 
+/// Cumulative in-block counters that are not stored in the EVM state trie.
+///
+/// A simulation batch may rebuild the executor between transactions so it can
+/// extract an exact per-transaction bundle. Carrying this value forward keeps
+/// ArbOS's block gas limit and pre-v50 first-user-transaction behavior intact.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArbSimulationProgress {
+    pub block_gas_left: Option<u64>,
+    pub user_txs_processed: u64,
+}
+
 impl<'a, Evm, Spec, R: ReceiptBuilder> ArbBlockExecutor<'a, Evm, Spec, R> {
     /// Set the ArbOS hooks for this block execution.
     pub fn with_hooks(mut self, hooks: DefaultArbOsHooks) -> Self {
@@ -373,6 +384,24 @@ impl<'a, Evm, Spec, R: ReceiptBuilder> ArbBlockExecutor<'a, Evm, Spec, R> {
     /// be the same slot held by the [`MultiGasInspector`] installed on `evm`.
     pub fn set_multi_gas_sink(&mut self, sink: crate::multi_gas::MultiGasSink) {
         self.multi_gas_sink = sink;
+    }
+
+    /// Restore cumulative counters after block-start state has initialized a
+    /// freshly-created simulation executor.
+    pub fn set_simulation_progress(&mut self, progress: ArbSimulationProgress) {
+        if let Some(block_gas_left) = progress.block_gas_left {
+            self.block_gas_left = block_gas_left;
+        }
+        self.user_txs_processed = progress.user_txs_processed;
+    }
+
+    /// Capture cumulative counters for the next transaction in a simulation
+    /// batch.
+    pub fn simulation_progress(&self) -> ArbSimulationProgress {
+        ArbSimulationProgress {
+            block_gas_left: Some(self.block_gas_left),
+            user_txs_processed: self.user_txs_processed,
+        }
     }
 
     /// Returns the set of zombie account addresses.
