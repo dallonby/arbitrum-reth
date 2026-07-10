@@ -2637,10 +2637,18 @@ where
                 let delete_balance_storage = arb_state_retry.backing_storage.clone();
                 let escrow_storage = arb_state_retry.backing_storage.clone();
 
-                // Compute multi-dimensional cost for refund (ArbOS v60+).
-                let multi_dimensional_cost = if self.arb_ctx.arbos_version
-                    >= arb_chainspec::arbos_version::ARBOS_VERSION_MULTI_GAS_CONSTRAINTS
-                {
+                // ArbOS 60 evaluated multi-gas refunds unconditionally. At
+                // v61+ Nitro only does so when multi-gas constraints are the
+                // active pricing model.
+                let should_compute_multi_gas_refund = {
+                    // SAFETY: see `Storage::state_mut()` invariant.
+                    let state_ref = unsafe { arb_state_retry.backing_storage.state_mut() };
+                    arb_state_retry
+                        .l2_pricing_state
+                        .should_compute_multi_gas_refund(state_ref)
+                        .unwrap_or(false)
+                };
+                let multi_dimensional_cost = if should_compute_multi_gas_refund {
                     let cached = self.multi_gas_current_fees.get_or_init(|| {
                         // SAFETY: see `Storage::state_mut()` invariant.
                         let state_ref = unsafe { arb_state_retry.backing_storage.state_mut() };
@@ -2657,6 +2665,7 @@ where
                             state_ref,
                             pending.charged_multi_gas,
                             cached,
+                            self.arb_ctx.basefee,
                         )
                         .ok()
                 } else {
@@ -2880,7 +2889,6 @@ where
                     self.touched_accounts.insert(dist.infra_fee_account);
                     self.touched_accounts.insert(dist.poster_fee_destination);
 
-                    let arbos_version_active = self.arb_ctx.arbos_version;
                     let basefee_active = self.arb_ctx.basefee;
                     let charged_multi_gas = pending.charged_multi_gas;
                     let poster_gas_active = pending.poster_gas;
@@ -2898,9 +2906,15 @@ where
                         let overlay_ptr = &mut self.state_overlay as *mut StateOverlay;
 
                         let mut refund_done = false;
-                        if arbos_version_active
-                            >= arb_chainspec::arbos_version::ARBOS_VERSION_MULTI_GAS_CONSTRAINTS
-                        {
+                        let should_compute_multi_gas_refund = {
+                            // SAFETY: see `Storage::state_mut()` invariant.
+                            let state_ref = unsafe { arb_state_post.backing_storage.state_mut() };
+                            arb_state_post
+                                .l2_pricing_state
+                                .should_compute_multi_gas_refund(state_ref)
+                                .unwrap_or(false)
+                        };
+                        if should_compute_multi_gas_refund {
                             let total_cost =
                                 basefee_active.saturating_mul(U256::from(gas_used_total));
                             let cached = self.multi_gas_current_fees.get_or_init(|| {
@@ -2920,6 +2934,7 @@ where
                                     state_ref,
                                     charged_multi_gas,
                                     cached,
+                                    basefee_active,
                                 )
                                 .unwrap_or(total_cost);
                             if total_cost > multi_cost {

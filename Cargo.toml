@@ -242,3 +242,7 @@ inherits = "release"
 lto = false
 codegen-units = 256
 incremental = true
+
+[patch."https://github.com/paradigmxyz/reth.git"]
+# The pinned Reth revision implements these MDBX modes but omits them from SyncMode's parser.
+reth-libmdbx = { path = "../reth-20cfb2d-utterly/crates/storage/libmdbx-rs" }

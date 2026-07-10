@@ -51,6 +51,12 @@ impl ChainSpecParser for ArbChainSpecParser {
         let mut value: Value =
             serde_json::from_str(&raw).map_err(|e| eyre!("parse chain spec JSON: {e}"))?;
 
+        // New Nitro genesis files no longer expose a top-level `config` object.
+        // They carry the byte-exact JSON in `serializedChainConfig` instead.
+        // Reth still needs `config` to build its ChainSpec, while ArbOS must
+        // store the original bytes (not a serde re-serialization) at genesis.
+        let serialized_chain_config = normalize_serialized_chain_config(&mut value)?;
+
         let initial_arbos = value
             .pointer("/config/arbitrum/InitialArbOSVersion")
             .and_then(Value::as_u64)
@@ -65,6 +71,7 @@ impl ChainSpecParser for ArbChainSpecParser {
             .and_then(|s| Address::from_str(s.trim_start_matches("0x")).ok())
             .unwrap_or(Address::ZERO);
         let arbos_init = parse_arbos_init(&value);
+        let initial_l1_base_fee = parse_initial_l1_base_fee(&value)?;
 
         let skip_injection = value
             .pointer(SKIP_GENESIS_INJECTION_POINTER)
@@ -84,6 +91,8 @@ impl ChainSpecParser for ArbChainSpecParser {
                 initial_arbos,
                 initial_owner,
                 arbos_init,
+                serialized_chain_config,
+                initial_l1_base_fee,
             )?;
             override_arbos_genesis_header(&mut value, initial_arbos)?;
         }
@@ -91,6 +100,41 @@ impl ChainSpecParser for ArbChainSpecParser {
         let augmented = serde_json::to_string(&value)?;
         EthereumChainSpecParser::parse(&augmented)
     }
+}
+
+/// Materialize Nitro's modern `serializedChainConfig` field as the `config`
+/// object expected by Reth, retaining the exact source bytes for ArbOS state.
+fn normalize_serialized_chain_config(value: &mut Value) -> eyre::Result<Option<Vec<u8>>> {
+    let Some(serialized) = value
+        .get("serializedChainConfig")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return Ok(None);
+    };
+
+    let config: Value = serde_json::from_str(&serialized)
+        .map_err(|e| eyre!("parse serializedChainConfig JSON: {e}"))?;
+    if !config.is_object() {
+        return Err(eyre!("serializedChainConfig is not a JSON object"));
+    }
+
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| eyre!("chain spec is not a JSON object"))?;
+    match obj.get("config") {
+        Some(existing) if !existing.is_null() && existing != &config => {
+            return Err(eyre!(
+                "config and serializedChainConfig describe different chain configurations"
+            ));
+        }
+        Some(existing) if !existing.is_null() => {}
+        _ => {
+            obj.insert("config".into(), config);
+        }
+    }
+
+    Ok(Some(serialized.into_bytes()))
 }
 
 /// Returns the `AllowDebugPrecompiles` flag declared in the chain spec's
@@ -151,12 +195,14 @@ fn override_arbos_genesis_header(value: &mut Value, arbos_version: u64) -> eyre:
 
 fn parse_arbos_init(value: &Value) -> genesis::ArbOSInit {
     let native = value
-        .pointer("/config/arbitrum/ArbOSInit/nativeTokenSupplyManagementEnabled")
+        .pointer("/arbOSInit/nativeTokenSupplyManagementEnabled")
+        .or_else(|| value.pointer("/config/arbitrum/ArbOSInit/nativeTokenSupplyManagementEnabled"))
         .or_else(|| value.pointer("/config/arbitrum/nativeTokenSupplyManagementEnabled"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let filtering = value
-        .pointer("/config/arbitrum/ArbOSInit/transactionFilteringEnabled")
+        .pointer("/arbOSInit/transactionFilteringEnabled")
+        .or_else(|| value.pointer("/config/arbitrum/ArbOSInit/transactionFilteringEnabled"))
         .or_else(|| value.pointer("/config/arbitrum/transactionFilteringEnabled"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
@@ -166,20 +212,43 @@ fn parse_arbos_init(value: &Value) -> genesis::ArbOSInit {
     }
 }
 
+fn parse_initial_l1_base_fee(value: &Value) -> eyre::Result<U256> {
+    let Some(raw) = value.pointer("/arbOSInit/initialL1BaseFee") else {
+        return Ok(U256::from(DEFAULT_INITIAL_L1_BASE_FEE_WEI));
+    };
+
+    let parsed = match raw {
+        Value::Number(number) => U256::from_str(&number.to_string()),
+        Value::String(s) => {
+            if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                U256::from_str_radix(hex, 16)
+            } else {
+                U256::from_str(s)
+            }
+        }
+        _ => return Err(eyre!("arbOSInit.initialL1BaseFee must be an integer")),
+    };
+    parsed.map_err(|e| eyre!("invalid arbOSInit.initialL1BaseFee: {e}"))
+}
+
 fn inject_arbos_alloc(
     value: &mut Value,
     chain_id: u64,
     arbos_version: u64,
     chain_owner: Address,
     arbos_init: genesis::ArbOSInit,
+    serialized_chain_config: Option<Vec<u8>>,
+    initial_l1_base_fee: U256,
 ) -> eyre::Result<()> {
     // Pre-compute the Go-canonical chain config bytes so the resulting
     // `chain_config` subspace slot layout matches a Go-style
     // `json.Unmarshal` + `json.Marshal` of the same chain spec.
-    let serialized_chain_config = value
-        .get("config")
-        .map(serialize_chain_config_go_style)
-        .unwrap_or_default();
+    let serialized_chain_config = serialized_chain_config.unwrap_or_else(|| {
+        value
+            .get("config")
+            .map(serialize_chain_config_go_style)
+            .unwrap_or_default()
+    });
 
     let alloc_obj = value
         .as_object_mut()
@@ -195,7 +264,7 @@ fn inject_arbos_alloc(
         chain_owner,
         arbos_init,
         serialized_chain_config,
-        U256::from(DEFAULT_INITIAL_L1_BASE_FEE_WEI),
+        initial_l1_base_fee,
     )?;
     for (addr, account) in entries {
         let key = address_lower_no_prefix(addr);

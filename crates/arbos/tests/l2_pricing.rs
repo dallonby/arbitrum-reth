@@ -4,6 +4,7 @@ use arb_test_utils::ArbosHarness;
 
 const ARBOS_V30: u64 = 30;
 const ARBOS_V60: u64 = 60;
+const ARBOS_V61: u64 = 61;
 
 fn weights(pairs: &[(ResourceKind, u64)]) -> [u64; NUM_RESOURCE_KIND] {
     let mut out = [0u64; NUM_RESOURCE_KIND];
@@ -165,4 +166,68 @@ fn initial_base_fee_equals_min() {
     let min = p.min_base_fee_wei(b).unwrap();
     assert_eq!(base, min);
     assert!(base > U256::ZERO);
+}
+
+#[test]
+fn multigas_refund_requires_active_constraints_starting_at_v61() {
+    let mut h60 = ArbosHarness::new()
+        .with_arbos_version(ARBOS_V60)
+        .initialize();
+    let state60 = h60.state_ptr();
+    let pricing60 = h60.l2_pricing_state();
+    assert!(
+        pricing60
+            .should_compute_multi_gas_refund(unsafe { &mut *state60 })
+            .unwrap(),
+        "v60 historical behavior evaluates the refund without constraints"
+    );
+
+    let mut h61 = ArbosHarness::new()
+        .with_arbos_version(ARBOS_V61)
+        .initialize();
+    let state61 = h61.state_ptr();
+    let pricing61 = h61.l2_pricing_state();
+    let backend61 = unsafe { &mut *state61 };
+    assert!(
+        !pricing61
+            .should_compute_multi_gas_refund(backend61)
+            .unwrap(),
+        "v61 must skip the refund until multi-gas constraints are configured"
+    );
+
+    pricing61
+        .add_multi_gas_constraint(
+            backend61,
+            100,
+            10,
+            0,
+            &weights(&[(ResourceKind::Computation, 1)]),
+        )
+        .unwrap();
+    assert!(
+        pricing61
+            .should_compute_multi_gas_refund(backend61)
+            .unwrap(),
+        "v61 evaluates the refund when multi-gas constraints are active"
+    );
+}
+
+#[test]
+fn multigas_refund_uses_block_base_fee_starting_at_v61() {
+    let stored_base_fee = U256::from(111u64);
+    let block_base_fee = U256::from(222u64);
+
+    for (version, expected) in [(ARBOS_V60, stored_base_fee), (ARBOS_V61, block_base_fee)] {
+        let mut h = ArbosHarness::new().with_arbos_version(version).initialize();
+        let state = h.state_ptr();
+        let pricing = h.l2_pricing_state();
+        let backend = unsafe { &mut *state };
+        pricing.set_base_fee_wei(backend, stored_base_fee).unwrap();
+
+        let fees = pricing
+            .get_multi_gas_base_fee_per_resource(backend, block_base_fee)
+            .unwrap();
+        assert_eq!(fees[ResourceKind::SingleDim as usize], expected);
+        assert_eq!(fees[ResourceKind::Computation as usize], expected);
+    }
 }

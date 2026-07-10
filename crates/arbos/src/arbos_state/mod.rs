@@ -72,7 +72,8 @@ cached_root_key!(
 );
 
 /// The maximum ArbOS version supported by this node.
-pub const MAX_ARBOS_VERSION_SUPPORTED: u64 = 60;
+pub const MAX_ARBOS_VERSION_SUPPORTED: u64 =
+    arb_chainspec::arbos_version::MAX_ARBOS_VERSION_SUPPORTED;
 
 /// Central ArbOS state aggregating all subsystem states.
 pub struct ArbosState<'a, D, B: Burner> {
@@ -561,6 +562,8 @@ impl<'a, D: Database, B: Burner> ArbosState<'a, D, B> {
                             .open_sub_storage(TRANSACTION_FILTERER_SUBSPACE),
                     )?;
                 }
+                // ArbOS 61 fixes runtime accounting only; no state migration.
+                61 => {}
                 _ => {
                     tracing::error!(version = next, "unsupported ArbOS version");
                     return Err(ArbosStateError::UnsupportedRunningVersion(next));

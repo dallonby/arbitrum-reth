@@ -1,6 +1,7 @@
 //! Pins the canonical genesis header constants the parser must produce.
 
 use alloy_primitives::{address, hex, Address, Bytes, B256, B64, U256};
+use arb_chainspec::ArbitrumChainSpec;
 use arb_node::chainspec::ArbChainSpecParser;
 use reth_chainspec::EthChainSpec;
 use reth_cli::chainspec::ChainSpecParser;
@@ -86,7 +87,7 @@ fn genesis_header_matches_nitro_for_arbos_v50() {
 
 #[test]
 fn genesis_header_mix_hash_encodes_version_at_byte_23() {
-    for &v in &[10u64, 11, 20, 30, 31, 32, 40, 41, 50, 51, 60] {
+    for &v in &[10u64, 11, 20, 30, 31, 32, 40, 41, 50, 51, 60, 61] {
         let json = build_chain_json(v);
         let spec = ArbChainSpecParser::parse(&json).expect("parse");
         let header = spec.genesis_header();
@@ -460,4 +461,39 @@ fn production_sepolia_hash_unchanged() {
         expected_hash,
         "production Sepolia block hash must not regress"
     );
+}
+
+/// Robinhood publishes a Nitro genesis using the modern
+/// `serializedChainConfig` + `arbOSInit` schema. Parsing that file must
+/// reproduce the canonical block zero served by the public RPC exactly.
+#[test]
+fn production_robinhood_mainnet_genesis_matches_rpc() {
+    let path = format!(
+        "{}/../../genesis/robinhood-mainnet.json",
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    let spec = ArbChainSpecParser::parse(&path).expect("parse Robinhood mainnet genesis");
+    let expected_hash: B256 =
+        hex!("aad15f3d702aaea00caf3e9bb56395efe9127bc3b31b24921abf1eee3409305c").into();
+    let expected_state_root: B256 =
+        hex!("bff31855ecf33b2db87febb9e571d57497a45d20d94c3024173bf82fedd44fd0").into();
+
+    assert_eq!(spec.chain().id(), 4663, "Robinhood mainnet chain ID");
+    assert_eq!(spec.max_code_size(), 98_304, "Robinhood MaxCodeSize");
+    assert_eq!(
+        spec.max_init_code_size(),
+        196_608,
+        "Robinhood MaxInitCodeSize"
+    );
+    assert_eq!(
+        spec.genesis_header().state_root,
+        expected_state_root,
+        "Robinhood mainnet state root must match its public RPC"
+    );
+    assert_eq!(
+        spec.genesis_hash(),
+        expected_hash,
+        "Robinhood mainnet block hash must match its public RPC"
+    );
+    assert_eq!(spec.genesis_header().mix_hash, expected_mix_hash(51));
 }

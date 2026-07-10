@@ -33,11 +33,13 @@ pub struct ArbEvmConfig<ChainSpec = reth_chainspec::ChainSpec> {
     pub executor_factory: ArbBlockExecutorFactory<ArbReceiptBuilder, Arc<ChainSpec>, ArbEvmFactory>,
     pub block_assembler: ArbBlockAssembler<ChainSpec>,
     chain_spec: Arc<ChainSpec>,
+    max_code_size: usize,
+    max_init_code_size: usize,
 }
 
 impl<ChainSpec> ArbEvmConfig<ChainSpec>
 where
-    ChainSpec: EthChainSpec + 'static,
+    ChainSpec: EthChainSpec + ArbitrumChainSpec + 'static,
 {
     /// Creates a new Arbitrum EVM configuration with the given chain spec.
     pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
@@ -56,6 +58,8 @@ where
     }
 
     fn build(chain_spec: Arc<ChainSpec>, allow_debug: bool, evm_factory: ArbEvmFactory) -> Self {
+        let max_code_size = chain_spec.max_code_size();
+        let max_init_code_size = chain_spec.max_init_code_size();
         Self {
             executor_factory: ArbBlockExecutorFactory::new(
                 ArbReceiptBuilder,
@@ -65,6 +69,8 @@ where
             .with_allow_debug_precompiles(allow_debug),
             block_assembler: ArbBlockAssembler::new(chain_spec.clone()),
             chain_spec,
+            max_code_size,
+            max_init_code_size,
         }
     }
 
@@ -112,7 +118,13 @@ where
             self.executor_factory.allow_debug_precompiles(),
         );
 
-        let cfg_env = arb_cfg_env(chain_id, spec, arbos_version);
+        let cfg_env = arb_cfg_env(
+            chain_id,
+            spec,
+            arbos_version,
+            self.max_code_size,
+            self.max_init_code_size,
+        );
         // Arbitrum sets PREVRANDAO to BigToHash(difficulty), which is 0x...0001.
         let prevrandao = B256::from(U256::from(1));
         let block_env = BlockEnv {
@@ -155,7 +167,13 @@ where
             self.executor_factory.allow_debug_precompiles(),
         );
 
-        let cfg_env = arb_cfg_env(chain_id, spec, arbos_version);
+        let cfg_env = arb_cfg_env(
+            chain_id,
+            spec,
+            arbos_version,
+            self.max_code_size,
+            self.max_init_code_size,
+        );
         // Arbitrum sets PREVRANDAO to BigToHash(difficulty), which is 0x...0001.
         let prevrandao = B256::from(U256::from(1));
         let block_env = BlockEnv {
@@ -235,7 +253,13 @@ where
             self.executor_factory.allow_debug_precompiles(),
         );
 
-        let cfg_env = arb_cfg_env(self.chain_spec.chain().id(), spec, arbos_version);
+        let cfg_env = arb_cfg_env(
+            self.chain_spec.chain().id(),
+            spec,
+            arbos_version,
+            self.max_code_size,
+            self.max_init_code_size,
+        );
 
         // Arbitrum sets PREVRANDAO to BigToHash(difficulty), which is 0x...0001.
         let prevrandao = B256::from(U256::from(1));
@@ -391,10 +415,18 @@ fn stage_rpc_block_ctx(
 /// Stylus WASM programs can be deployed. Disables the priority fee
 /// ordering check (Arbitrum tips are always dropped). Disables EIP-7623
 /// increased calldata cost (irrelevant on L2 without blobs).
-fn arb_cfg_env(chain_id: u64, spec: SpecId, arbos_version: u64) -> CfgEnv {
+fn arb_cfg_env(
+    chain_id: u64,
+    spec: SpecId,
+    arbos_version: u64,
+    max_code_size: usize,
+    max_init_code_size: usize,
+) -> CfgEnv {
     let mut cfg = CfgEnv::new()
         .with_chain_id(chain_id)
         .with_spec_and_mainnet_gas_params(spec);
+    cfg.limit_contract_code_size = Some(max_code_size);
+    cfg.limit_contract_initcode_size = Some(max_init_code_size);
     // Arbitrum drops tips — max_priority_fee can exceed max_fee.
     cfg.disable_priority_fee_check = true;
     // EIP-7623 increases calldata cost for blob-less chains; irrelevant on L2.
@@ -423,6 +455,18 @@ fn arb_cfg_env(chain_id: u64, spec: SpecId, arbos_version: u64) -> CfgEnv {
     // PerTxGasLimit instead, applied during the gas-charging hook.
     cfg.tx_gas_limit_cap = Some(u64::MAX);
     cfg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arb_cfg_env_applies_chain_code_size_limits() {
+        let cfg = arb_cfg_env(4663, SpecId::OSAKA, 61, 98_304, 196_608);
+        assert_eq!(cfg.limit_contract_code_size, Some(98_304));
+        assert_eq!(cfg.limit_contract_initcode_size, Some(196_608));
+    }
 }
 
 /// Extract ArbOS version from header mix_hash (bytes 16-23).

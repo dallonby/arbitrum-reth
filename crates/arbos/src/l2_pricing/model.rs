@@ -48,6 +48,22 @@ impl<D: Database> L2PricingState<'_, D> {
         Ok(GasModel::Legacy)
     }
 
+    /// Whether end-of-transaction processing should evaluate a multi-gas
+    /// refund. ArbOS 60 did so unconditionally; ArbOS 61 fixes spurious
+    /// refunds on chains that never enabled multi-gas constraints.
+    pub fn should_compute_multi_gas_refund<B: SystemStateBackend>(
+        &self,
+        backend: &mut B,
+    ) -> Result<bool, L2PricingError> {
+        if self.arbos_version < version::ARBOS_VERSION_MULTI_GAS_CONSTRAINTS {
+            return Ok(false);
+        }
+        if self.arbos_version < version::ARBOS_VERSION_MULTI_GAS_REFUND_FIX {
+            return Ok(true);
+        }
+        Ok(self.gas_model_to_use(backend)? == GasModel::MultiGasConstraints)
+    }
+
     /// Grow the gas backlog for the active pricing model.
     pub fn grow_backlog<B: StorageBackend>(
         &self,
@@ -338,8 +354,16 @@ impl<D: Database> L2PricingState<'_, D> {
     pub fn get_multi_gas_base_fee_per_resource<B: SystemStateBackend>(
         &self,
         backend: &mut B,
+        block_base_fee: U256,
     ) -> Result<[U256; NUM_RESOURCE_KIND], L2PricingError> {
-        let base_fee = self.base_fee_wei(backend)?;
+        // Before ArbOS 61 Nitro used the pricing-state value, which may have
+        // advanced to the next block already. Preserve that historical
+        // behavior, but use the actual header/base fee for v61 and newer.
+        let base_fee = if self.arbos_version < version::ARBOS_VERSION_MULTI_GAS_REFUND_FIX {
+            self.base_fee_wei(backend)?
+        } else {
+            block_base_fee
+        };
         let mgf = super::multi_gas_fees::open_multi_gas_fees(self.multi_gas_base_fees.clone());
         let mut fees = [U256::ZERO; NUM_RESOURCE_KIND];
         for kind in ResourceKind::ALL {
@@ -467,8 +491,9 @@ impl<D: Database> L2PricingState<'_, D> {
         &self,
         backend: &mut B,
         gas_used: MultiGas,
+        block_base_fee: U256,
     ) -> Result<U256, L2PricingError> {
-        let fees = self.get_multi_gas_base_fee_per_resource(backend)?;
+        let fees = self.get_multi_gas_base_fee_per_resource(backend, block_base_fee)?;
         let mut total = U256::ZERO;
         for kind in ResourceKind::ALL {
             let amount = gas_used.get(kind);
@@ -493,8 +518,13 @@ impl<D: Database> L2PricingState<'_, D> {
         backend: &mut B,
         gas_used: MultiGas,
         cached_fees: &[U256; NUM_RESOURCE_KIND],
+        block_base_fee: U256,
     ) -> Result<U256, L2PricingError> {
-        let base_fee = self.base_fee_wei(backend)?;
+        let base_fee = if self.arbos_version < version::ARBOS_VERSION_MULTI_GAS_REFUND_FIX {
+            self.base_fee_wei(backend)?
+        } else {
+            block_base_fee
+        };
         let mut total = U256::ZERO;
         for kind in ResourceKind::ALL {
             let amount = gas_used.get(kind);

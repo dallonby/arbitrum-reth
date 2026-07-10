@@ -5056,7 +5056,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
@@ -5689,9 +5689,9 @@ dependencies = [
 
 [[package]]
 name = "keccak-asm"
-version = "0.1.5"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b646a74e746cd25045aa0fd42f4f7f78aa6d119380182c7e63a5593c4ab8df6f"
+checksum = "dd5dc2c0d691cbf7595cde551ced329cca99c2387c2cbc97754c5d0cd045d3ee"
 dependencies = [
  "digest 0.10.7",
  "sha3-asm",
@@ -8904,7 +8904,6 @@ dependencies = [
 [[package]]
 name = "reth-libmdbx"
 version = "1.11.1"
-source = "git+https://github.com/paradigmxyz/reth.git?rev=20cfb2d517#20cfb2d51772f3f0f35bc3a34cb78b3196884a15"
 dependencies = [
  "bitflags 2.11.0",
  "byteorder",
@@ -8920,7 +8919,6 @@ dependencies = [
 [[package]]
 name = "reth-mdbx-sys"
 version = "1.11.1"
-source = "git+https://github.com/paradigmxyz/reth.git?rev=20cfb2d517#20cfb2d51772f3f0f35bc3a34cb78b3196884a15"
 dependencies = [
  "bindgen",
  "cc",
@@ -11277,9 +11275,9 @@ dependencies = [
 
 [[package]]
 name = "sha3-asm"
-version = "0.1.5"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b31139435f327c93c6038ed350ae4588e2c70a13d50599509fee6349967ba35a"
+checksum = "a6287fd675f713484342a89cbf0a386abef5f15919cfad607e5e1f19e1e15331"
 dependencies = [
  "cc",
  "cfg-if",

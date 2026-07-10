@@ -1401,7 +1401,9 @@ where
     if total_gas < upfront_cost {
         // Only the outermost Stylus frame leaves its abort gas undimensioned; a
         // Stylus ancestor folds a nested abort into its own computation.
-        if stylus_frame_depth == 1 {
+        if arbos_version >= arb_chainspec::arbos_version::ARBOS_VERSION_MULTI_GAS_REFUND_FIX
+            && stylus_frame_depth == 1
+        {
             ctx.add_stylus_upfront_oog_gas(total_gas);
         }
         return InterpreterResult::new(InstructionResult::OutOfGas, Bytes::new(), zero_gas());

@@ -6,6 +6,29 @@
 use reth_chainspec::ChainSpec;
 pub use reth_chainspec::EthChainSpec;
 use revm::primitives::hardfork::SpecId;
+use serde::Deserialize;
+
+/// Ethereum's default EIP-170 deployed bytecode limit.
+pub const DEFAULT_MAX_CODE_SIZE: usize = 24_576;
+/// Ethereum's default EIP-3860 initcode limit.
+pub const DEFAULT_MAX_INIT_CODE_SIZE: usize = DEFAULT_MAX_CODE_SIZE * 2;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ArbitrumCodeSizeConfig {
+    max_code_size: u64,
+    max_init_code_size: u64,
+}
+
+fn arbitrum_code_size_config(chain_spec: &ChainSpec) -> ArbitrumCodeSizeConfig {
+    chain_spec
+        .genesis()
+        .config
+        .extra_fields
+        .get_deserialized::<ArbitrumCodeSizeConfig>("arbitrum")
+        .and_then(Result::ok)
+        .unwrap_or_default()
+}
 
 /// ArbOS version constants.
 ///
@@ -45,8 +68,6 @@ pub mod arbos_version {
     /// ArbOS version 50 — Dia upgrade.
     pub const ARBOS_VERSION_50: u64 = 50;
     pub const ARBOS_VERSION_DIA: u64 = ARBOS_VERSION_50;
-    /// Maximum ArbOS version supported by this node.
-    pub const MAX_ARBOS_VERSION_SUPPORTED: u64 = ARBOS_VERSION_60;
     /// ArbOS version 51 — multi-constraint fix.
     pub const ARBOS_VERSION_MULTI_CONSTRAINT_FIX: u64 = 51;
     pub const ARBOS_VERSION_51: u64 = 51;
@@ -56,6 +77,11 @@ pub mod arbos_version {
     pub const ARBOS_VERSION_60: u64 = 60;
     pub const ARBOS_VERSION_STYLUS_CONTRACT_LIMIT: u64 = ARBOS_VERSION_60;
     pub const ARBOS_VERSION_TRANSACTION_FILTERING: u64 = ARBOS_VERSION_60;
+    /// ArbOS version 61 — multi-gas refund and Stylus OOG attribution fixes.
+    pub const ARBOS_VERSION_61: u64 = 61;
+    pub const ARBOS_VERSION_MULTI_GAS_REFUND_FIX: u64 = ARBOS_VERSION_61;
+    /// Maximum ArbOS version supported by this node.
+    pub const MAX_ARBOS_VERSION_SUPPORTED: u64 = ARBOS_VERSION_61;
 }
 
 /// Trait for Arbitrum chain specifications.
@@ -71,6 +97,16 @@ pub trait ArbitrumChainSpec {
 
     /// Maps an ArbOS version to the appropriate SpecId.
     fn spec_id_by_arbos_version(&self, arbos_version: u64) -> SpecId;
+
+    /// Maximum deployed contract bytecode size configured for this chain.
+    fn max_code_size(&self) -> usize {
+        DEFAULT_MAX_CODE_SIZE
+    }
+
+    /// Maximum contract initcode size configured for this chain.
+    fn max_init_code_size(&self) -> usize {
+        self.max_code_size().saturating_mul(2)
+    }
 }
 
 /// Map ArbOS version to the appropriate SpecId.
@@ -138,6 +174,24 @@ impl ArbitrumChainSpec for ChainSpec {
 
     fn spec_id_by_arbos_version(&self, arbos_version: u64) -> SpecId {
         spec_id_by_arbos_version(arbos_version)
+    }
+
+    fn max_code_size(&self) -> usize {
+        let configured = arbitrum_code_size_config(self).max_code_size;
+        if configured == 0 {
+            DEFAULT_MAX_CODE_SIZE
+        } else {
+            usize::try_from(configured).unwrap_or(usize::MAX)
+        }
+    }
+
+    fn max_init_code_size(&self) -> usize {
+        let configured = arbitrum_code_size_config(self).max_init_code_size;
+        if configured == 0 {
+            self.max_code_size().saturating_mul(2)
+        } else {
+            usize::try_from(configured).unwrap_or(usize::MAX)
+        }
     }
 }
 
