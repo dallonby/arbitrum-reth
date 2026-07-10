@@ -91,6 +91,7 @@ where
         block: &RecoveredBlock<N::Block>,
         result: &BlockExecutionResult<N::Receipt>,
         receipt_root_bloom: Option<ReceiptRootBloom>,
+        _block_access_list_hash: Option<alloy_primitives::B256>,
     ) -> Result<(), ConsensusError> {
         if !self.verify_execution {
             return Ok(());

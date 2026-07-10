@@ -66,9 +66,61 @@ use alloy_evm::{
     precompiles::{DynPrecompile, PrecompileInput, PrecompilesMap},
     EvmInternals,
 };
+use alloy_primitives::Bytes;
 use arb_context::ArbPrecompileCtx;
-use revm::precompile::{PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult};
+use revm::precompile::{
+    PrecompileId, PrecompileOutput as RevmPrecompileOutput,
+    PrecompileResult as RevmPrecompileResult,
+};
 use std::sync::Arc;
+
+/// Internal result used by ArbOS handlers. Revm 40 reserves its own
+/// `PrecompileError` for block-fatal failures, so user-visible reverts and OOG
+/// remain structured until the outer provider boundary.
+pub(crate) type ArbPrecompileResult = Result<RevmPrecompileOutput, ArbPrecompileError>;
+
+/// Compatibility constructors for the pre-Revm-40 handler code. The outer
+/// dispatch boundary restores the call's EIP-8037 reservoir on every output.
+pub(crate) struct ArbPrecompileOutput;
+
+impl ArbPrecompileOutput {
+    pub(crate) fn new(gas_used: u64, bytes: Bytes) -> RevmPrecompileOutput {
+        RevmPrecompileOutput::new(gas_used, bytes, 0)
+    }
+
+    pub(crate) fn new_reverted(gas_used: u64, bytes: Bytes) -> RevmPrecompileOutput {
+        RevmPrecompileOutput::revert(gas_used, bytes, 0)
+    }
+}
+
+pub(crate) fn finish_arb_precompile(
+    result: ArbPrecompileResult,
+    gas_limit: u64,
+    reservoir: u64,
+) -> RevmPrecompileResult {
+    match result {
+        Ok(mut output) => {
+            output.reservoir = reservoir;
+            Ok(output)
+        }
+        Err(error) => error.into_precompile_result(gas_limit, reservoir),
+    }
+}
+
+pub(crate) fn new_arb_precompile(
+    id: PrecompileId,
+    ctx: Arc<ArbPrecompileCtx>,
+    handler: for<'a> fn(PrecompileInput<'a>, &ArbPrecompileCtx) -> ArbPrecompileResult,
+) -> DynPrecompile {
+    DynPrecompile::new_stateful(id, move |input| {
+        let gas_limit = input.gas;
+        let reservoir = input.reservoir;
+        finish_arb_precompile(handler(input, &ctx), gas_limit, reservoir)
+    })
+}
+
+use ArbPrecompileOutput as PrecompileOutput;
+use ArbPrecompileResult as PrecompileResult;
 
 /// RIP-7212 P256VERIFY precompile address (ArbOS v30+).
 pub const P256VERIFY_ADDRESS: alloy_primitives::Address =
@@ -91,19 +143,28 @@ const BLS12_381_ADDRESSES: [alloy_primitives::Address; 7] = [
 
 fn create_p256verify_precompile() -> DynPrecompile {
     DynPrecompile::new(PrecompileId::P256Verify, |input: PrecompileInput<'_>| {
-        revm::precompile::secp256r1::p256_verify(input.data, input.gas)
+        Ok(RevmPrecompileOutput::from_eth_result(
+            revm::precompile::secp256r1::p256_verify(input.data, input.gas),
+            input.reservoir,
+        ))
     })
 }
 
 fn create_p256verify_osaka_precompile() -> DynPrecompile {
     DynPrecompile::new(PrecompileId::P256Verify, |input: PrecompileInput<'_>| {
-        revm::precompile::secp256r1::p256_verify_osaka(input.data, input.gas)
+        Ok(RevmPrecompileOutput::from_eth_result(
+            revm::precompile::secp256r1::p256_verify_osaka(input.data, input.gas),
+            input.reservoir,
+        ))
     })
 }
 
 fn create_modexp_osaka_precompile() -> DynPrecompile {
     DynPrecompile::new(PrecompileId::ModExp, |input: PrecompileInput<'_>| {
-        revm::precompile::modexp::osaka_run(input.data, input.gas)
+        Ok(RevmPrecompileOutput::from_eth_result(
+            revm::precompile::modexp::osaka_run(input.data, input.gas),
+            input.reservoir,
+        ))
     })
 }
 
@@ -330,10 +391,10 @@ fn gas_check(
     result: PrecompileResult,
 ) -> PrecompileResult {
     if gas_used > gas_limit {
-        return Err(PrecompileError::OutOfGas);
+        return Err(ArbPrecompileError::OutOfGas);
     }
     match result {
-        Err(PrecompileError::Other(_)) if ctx.block.arbos_version >= 11 => Ok(
+        Err(ArbPrecompileError::Revert { .. }) if ctx.block.arbos_version >= 11 => Ok(
             PrecompileOutput::new_reverted(gas_used.min(gas_limit), Default::default()),
         ),
         other => other,

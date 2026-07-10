@@ -14,7 +14,11 @@ pub unsafe extern "C" fn __rust_probestack() {}
 mod commands;
 
 use arb_node::{
-    chainspec::ArbChainSpecParser, cli_components, launcher::ArbEngineLauncher, ArbNode,
+    args::{install_runtime_args, RollupArgs},
+    chainspec::ArbChainSpecParser,
+    cli_components,
+    launcher::ArbEngineLauncher,
+    ArbNode,
 };
 use clap::Parser;
 use reth::{cli::Cli, CliRunner};
@@ -42,11 +46,13 @@ fn main() {
         return;
     }
 
-    if let Err(err) = Cli::<ArbChainSpecParser>::parse().run_with_components::<ArbNode>(
+    if let Err(err) = Cli::<ArbChainSpecParser, RollupArgs>::parse().run_with_components::<ArbNode>(
         cli_components,
-        async move |builder, _| {
+        async move |builder, rollup_args| {
+            install_runtime_args(rollup_args.clone())
+                .map_err(|_| eyre::eyre!("rollup arguments were already initialized"))?;
             info!(target: "reth::cli", "Launching arb-reth node");
-            let node = builder.node(ArbNode::default());
+            let node = builder.node(ArbNode::new(rollup_args));
             let engine_tree_config = TreeConfig::default();
             let launcher = ArbEngineLauncher::new(
                 node.task_executor().clone(),
@@ -69,7 +75,7 @@ fn run_offline(sub: &str) -> eyre::Result<()> {
     let _ = args.next();
     let argv: Vec<_> = std::iter::once(bin).chain(args).collect();
 
-    let _guard = RethTracer::new().init().ok().flatten();
+    let _guard = RethTracer::new().init().ok();
 
     let runner = CliRunner::try_default_runtime()?;
     let runtime = runner.runtime();

@@ -136,6 +136,8 @@ where
             blob_gas_used: None,
             excess_blob_gas: None,
             requests_hash: None,
+            block_access_list_hash: None,
+            slot_number: None,
         };
 
         Ok(Block {

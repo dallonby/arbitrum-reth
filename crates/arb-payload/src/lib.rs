@@ -20,8 +20,7 @@ use alloy_rpc_types_engine::{
 use arb_primitives::ArbPrimitives;
 use reth_engine_primitives::EngineTypes;
 use reth_payload_primitives::{
-    BuiltPayload, PayloadAttributes as PayloadAttributesTrait, PayloadBuilderAttributes,
-    PayloadTypes,
+    BuiltPayload, PayloadAttributes as PayloadAttributesTrait, PayloadTypes,
 };
 use reth_primitives_traits::{NodePrimitives, SealedBlock};
 use serde::{Deserialize, Serialize};
@@ -47,6 +46,10 @@ pub struct ArbPayloadAttributes {
 }
 
 impl PayloadAttributesTrait for ArbPayloadAttributes {
+    fn payload_id(&self, parent_hash: &B256) -> PayloadId {
+        arb_payload_id(parent_hash, self)
+    }
+
     fn timestamp(&self) -> u64 {
         self.inner.timestamp
     }
@@ -57,6 +60,10 @@ impl PayloadAttributesTrait for ArbPayloadAttributes {
 
     fn parent_beacon_block_root(&self) -> Option<B256> {
         self.inner.parent_beacon_block_root
+    }
+
+    fn slot_number(&self) -> Option<u64> {
+        self.inner.slot_number
     }
 }
 
@@ -85,15 +92,12 @@ pub struct ArbPayloadBuilderAttributes {
     pub transactions: Vec<Bytes>,
 }
 
-impl PayloadBuilderAttributes for ArbPayloadBuilderAttributes {
-    type RpcPayloadAttributes = ArbPayloadAttributes;
-    type Error = PayloadIdComputeError;
-
-    fn try_new(
+impl ArbPayloadBuilderAttributes {
+    pub fn try_new(
         parent: B256,
         attributes: ArbPayloadAttributes,
         _version: u8,
-    ) -> Result<Self, Self::Error> {
+    ) -> Result<Self, PayloadIdComputeError> {
         let id = arb_payload_id(&parent, &attributes);
         Ok(Self {
             id,
@@ -108,31 +112,31 @@ impl PayloadBuilderAttributes for ArbPayloadBuilderAttributes {
         })
     }
 
-    fn payload_id(&self) -> PayloadId {
+    pub const fn payload_id(&self) -> PayloadId {
         self.id
     }
 
-    fn parent(&self) -> B256 {
+    pub const fn parent(&self) -> B256 {
         self.parent
     }
 
-    fn timestamp(&self) -> u64 {
+    pub const fn timestamp(&self) -> u64 {
         self.timestamp
     }
 
-    fn parent_beacon_block_root(&self) -> Option<B256> {
+    pub const fn parent_beacon_block_root(&self) -> Option<B256> {
         self.parent_beacon_block_root
     }
 
-    fn suggested_fee_recipient(&self) -> Address {
+    pub const fn suggested_fee_recipient(&self) -> Address {
         self.suggested_fee_recipient
     }
 
-    fn prev_randao(&self) -> B256 {
+    pub const fn prev_randao(&self) -> B256 {
         self.prev_randao
     }
 
-    fn withdrawals(&self) -> &Withdrawals {
+    pub const fn withdrawals(&self) -> &Withdrawals {
         &self.withdrawals
     }
 }
@@ -323,6 +327,18 @@ impl TryFrom<ArbBuiltPayload> for ExecutionPayloadEnvelopeV6 {
     }
 }
 
+impl From<ArbBuiltPayload> for ExecutionData {
+    fn from(value: ArbBuiltPayload) -> Self {
+        let block = Arc::unwrap_or_clone(value.block);
+        let (payload, sidecar) = AlloyExecutionPayload::from_block_unchecked_with_extras(
+            block.hash(),
+            &block.into_block(),
+            None,
+        );
+        Self { payload, sidecar }
+    }
+}
+
 // ── Payload Types ─────────────────────────────────────────────────────────────
 
 /// Payload types for the Arbitrum engine.
@@ -334,15 +350,18 @@ impl PayloadTypes for ArbPayloadTypes {
     type ExecutionData = ExecutionData;
     type BuiltPayload = ArbBuiltPayload;
     type PayloadAttributes = ArbPayloadAttributes;
-    type PayloadBuilderAttributes = ArbPayloadBuilderAttributes;
 
     fn block_to_payload(
         block: SealedBlock<
             <<Self::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block,
         >,
+        bal: Option<Bytes>,
     ) -> Self::ExecutionData {
-        let (payload, sidecar) =
-            AlloyExecutionPayload::from_block_unchecked(block.hash(), &block.into_block());
+        let (payload, sidecar) = AlloyExecutionPayload::from_block_unchecked_with_extras(
+            block.hash(),
+            &block.into_block(),
+            bal,
+        );
         ExecutionData { payload, sidecar }
     }
 }
@@ -359,24 +378,26 @@ pub struct ArbEngineTypes<T: PayloadTypes = ArbPayloadTypes> {
 impl<T: PayloadTypes<ExecutionData = ExecutionData>> PayloadTypes for ArbEngineTypes<T>
 where
     T::BuiltPayload: BuiltPayload<Primitives: NodePrimitives<Block = ArbBlock>>,
+    ExecutionData: From<T::BuiltPayload>,
 {
     type ExecutionData = T::ExecutionData;
     type BuiltPayload = T::BuiltPayload;
     type PayloadAttributes = T::PayloadAttributes;
-    type PayloadBuilderAttributes = T::PayloadBuilderAttributes;
 
     fn block_to_payload(
         block: SealedBlock<
             <<Self::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block,
         >,
+        bal: Option<Bytes>,
     ) -> Self::ExecutionData {
-        T::block_to_payload(block)
+        T::block_to_payload(block, bal)
     }
 }
 
 impl<T> EngineTypes for ArbEngineTypes<T>
 where
     T: PayloadTypes<ExecutionData = ExecutionData>,
+    ExecutionData: From<T::BuiltPayload>,
     T::BuiltPayload: BuiltPayload<Primitives: NodePrimitives<Block = ArbBlock>>
         + TryInto<ExecutionPayloadV1>
         + TryInto<ExecutionPayloadEnvelopeV2>

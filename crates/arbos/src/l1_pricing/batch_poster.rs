@@ -1,5 +1,4 @@
 use alloy_primitives::{Address, U256};
-use revm::Database;
 
 use crate::address_set::AddressSet;
 use arb_storage::{
@@ -32,7 +31,7 @@ pub struct FundsDueItem {
     pub funds_due: U256,
 }
 
-pub fn initialize_batch_posters_table<D: Database, B: StorageBackend>(
+pub fn initialize_batch_posters_table<D, B: StorageBackend>(
     l1_pricing_storage: &Storage<'_, D>,
     backend: &mut B,
     initial_poster: Address,

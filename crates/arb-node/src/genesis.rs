@@ -14,8 +14,8 @@ use arb_storage::{
         FEATURES_SUBSPACE, L1_PRICING_SUBSPACE, L2_PRICING_SUBSPACE, RETRYABLES_SUBSPACE,
         SEND_MERKLE_SUBSPACE,
     },
-    set_account_code, set_account_nonce, Storage, StorageBackedBigUint, StorageBackedBytes,
-    ARBOS_STATE_ADDRESS,
+    set_account_code, set_account_nonce, StateDbBackend, Storage, StorageBackedBigUint,
+    StorageBackedBytes, ARBOS_STATE_ADDRESS,
 };
 use arbos::{
     arbos_state::ArbosState, arbos_types::ParsedInitMessage, burn::SystemBurner, l1_pricing,
@@ -105,7 +105,10 @@ pub fn initialize_arbos_state<D: Database>(
     // 2. Set chain ID.
     // SAFETY: see initial state_mut() comment; no overlapping Storage handles.
     StorageBackedBigUint::new(B256::ZERO, 4)
-        .set(unsafe { backing.state_mut() }, U256::from(chain_id))
+        .set(
+            StateDbBackend::from_mut(unsafe { backing.state_mut() }),
+            U256::from(chain_id),
+        )
         .map_err(|source| GenesisError::StorageWrite {
             what: "chain id",
             source,
@@ -140,7 +143,7 @@ pub fn initialize_arbos_state<D: Database>(
         // SAFETY: see initial state_mut() comment.
         cc_bytes
             .set(
-                unsafe { backing.state_mut() },
+                StateDbBackend::from_mut(unsafe { backing.state_mut() }),
                 &init_msg.serialized_chain_config,
             )
             .map_err(|source| GenesisError::StorageWrite {
@@ -159,7 +162,7 @@ pub fn initialize_arbos_state<D: Database>(
     // SAFETY: see initial state_mut() comment.
     l1_pricing::L1PricingState::initialize(
         &l1_sto,
-        unsafe { backing.state_mut() },
+        StateDbBackend::from_mut(unsafe { backing.state_mut() }),
         rewards_recipient,
         init_msg.initial_l1_base_fee,
     )
@@ -171,12 +174,14 @@ pub fn initialize_arbos_state<D: Database>(
     // 5. Initialize L2 pricing state.
     let l2_sto = backing.open_sub_storage(L2_PRICING_SUBSPACE);
     // SAFETY: see initial state_mut() comment.
-    l2_pricing::L2PricingState::initialize(&l2_sto, unsafe { backing.state_mut() }).map_err(
-        |e| GenesisError::InitSubsystem {
-            subsystem: "L2 pricing",
-            source: e.into(),
-        },
-    )?;
+    l2_pricing::L2PricingState::initialize(
+        &l2_sto,
+        StateDbBackend::from_mut(unsafe { backing.state_mut() }),
+    )
+    .map_err(|e| GenesisError::InitSubsystem {
+        subsystem: "L2 pricing",
+        source: e.into(),
+    })?;
 
     // 6. Initialize retryable state.
     let ret_sto = backing.open_sub_storage(RETRYABLES_SUBSPACE);
@@ -224,7 +229,10 @@ pub fn initialize_arbos_state<D: Database>(
     // SAFETY: see initial state_mut() comment.
     arb_state
         .chain_owners
-        .add(unsafe { backing.state_mut() }, chain_owner)
+        .add(
+            StateDbBackend::from_mut(unsafe { backing.state_mut() }),
+            chain_owner,
+        )
         .map_err(|e| GenesisError::InitSubsystem {
             subsystem: "chain owner",
             source: e.into(),
@@ -233,7 +241,10 @@ pub fn initialize_arbos_state<D: Database>(
     if arbos_init.native_token_supply_management_enabled {
         // SAFETY: see initial state_mut() comment.
         arb_state
-            .set_native_token_management_from_time(unsafe { backing.state_mut() }, 1)
+            .set_native_token_management_from_time(
+                StateDbBackend::from_mut(unsafe { backing.state_mut() }),
+                1,
+            )
             .map_err(|source| GenesisError::InitSubsystem {
                 subsystem: "native token management",
                 source,
@@ -242,7 +253,10 @@ pub fn initialize_arbos_state<D: Database>(
     if arbos_init.transaction_filtering_enabled {
         // SAFETY: see initial state_mut() comment.
         arb_state
-            .set_transaction_filtering_from_time(unsafe { backing.state_mut() }, 1)
+            .set_transaction_filtering_from_time(
+                StateDbBackend::from_mut(unsafe { backing.state_mut() }),
+                1,
+            )
             .map_err(|source| GenesisError::InitSubsystem {
                 subsystem: "transaction filtering",
                 source,
@@ -252,7 +266,11 @@ pub fn initialize_arbos_state<D: Database>(
     if target_arbos_version > 1 {
         // SAFETY: see initial state_mut() comment.
         arb_state
-            .upgrade_arbos_version(unsafe { backing.state_mut() }, target_arbos_version, true)
+            .upgrade_arbos_version(
+                StateDbBackend::from_mut(unsafe { backing.state_mut() }),
+                target_arbos_version,
+                true,
+            )
             .map_err(|source| GenesisError::Upgrade {
                 target: target_arbos_version,
                 source,

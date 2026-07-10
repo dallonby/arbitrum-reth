@@ -1,10 +1,11 @@
+use crate::{ArbPrecompileOutput as PrecompileOutput, ArbPrecompileResult as PrecompileResult};
 use alloy_evm::precompiles::{DynPrecompile, PrecompileInput};
 use alloy_primitives::{Address, U256};
 use alloy_sol_types::SolInterface;
 use arb_context::ArbPrecompileCtx;
 use arb_storage::ARBOS_STATE_ADDRESS;
 use arbos::address_set::AddressSetError;
-use revm::precompile::{PrecompileId, PrecompileOutput, PrecompileResult};
+use revm::precompile::PrecompileId;
 use std::sync::Arc;
 
 use crate::{interfaces::IArbOwnerPublic, ArbPrecompileError};
@@ -20,9 +21,7 @@ const SSTORE_GAS: u64 = 20_000;
 const COPY_GAS: u64 = 3;
 
 pub fn create_arbownerpublic_precompile(ctx: Arc<ArbPrecompileCtx>) -> DynPrecompile {
-    DynPrecompile::new_stateful(PrecompileId::custom("arbownerpublic"), move |input| {
-        handler(input, &ctx)
-    })
+    crate::new_arb_precompile(PrecompileId::custom("arbownerpublic"), ctx, handler)
 }
 
 fn handler(mut input: PrecompileInput<'_>, ctx: &ArbPrecompileCtx) -> PrecompileResult {

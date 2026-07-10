@@ -1,3 +1,4 @@
+use crate::{ArbPrecompileOutput as PrecompileOutput, ArbPrecompileResult as PrecompileResult};
 use alloy_evm::precompiles::{DynPrecompile, PrecompileInput};
 use alloy_primitives::{keccak256, Address, Log, B256, U256};
 use alloy_sol_types::{SolError, SolEvent, SolInterface};
@@ -6,7 +7,7 @@ use arb_storage::ARBOS_STATE_ADDRESS;
 use arbos::retryables::{
     CancelOutcome, LookupOutcome, RetryableError, RETRYABLE_LIFETIME_SECONDS, RETRYABLE_REAP_PRICE,
 };
-use revm::precompile::{PrecompileId, PrecompileOutput, PrecompileResult};
+use revm::precompile::PrecompileId;
 use std::sync::Arc;
 
 use crate::{interfaces::IArbRetryableTx, ArbPrecompileError};
@@ -51,9 +52,7 @@ pub fn canceled_topic() -> B256 {
 }
 
 pub fn create_arbretryabletx_precompile(ctx: Arc<ArbPrecompileCtx>) -> DynPrecompile {
-    DynPrecompile::new_stateful(PrecompileId::custom("arbretryabletx"), move |input| {
-        handler(input, &ctx)
-    })
+    crate::new_arb_precompile(PrecompileId::custom("arbretryabletx"), ctx, handler)
 }
 
 fn handler(mut input: PrecompileInput<'_>, ctx: &ArbPrecompileCtx) -> PrecompileResult {

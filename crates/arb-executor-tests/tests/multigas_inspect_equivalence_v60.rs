@@ -29,10 +29,11 @@ use arb_test_utils::{ArbosHarness, EmptyDb};
 use reth_chainspec::ChainSpec;
 use reth_evm::{ConfigureEvm, EvmEnv};
 use revm::{
-    context::{BlockEnv, CfgEnv},
+    context::{BlockEnv, CfgEnv, TxEnv},
     database::{states::account_status::AccountStatus, PlainAccount, State},
     primitives::hardfork::SpecId,
     state::{AccountInfo, Bytecode},
+    InspectEvm,
 };
 use std::sync::Arc;
 
@@ -179,6 +180,7 @@ fn exec_ctx() -> EthBlockExecutionCtx<'static> {
         ommers: &[],
         withdrawals: None,
         extra_data: vec![0u8; 32].into(),
+        slot_number: None,
     }
 }
 
@@ -280,7 +282,7 @@ fn run_plain(targets: &[Address]) -> PostState {
         let result = executor
             .execute_transaction_without_commit(call_tx(*target, nonce as u64))
             .unwrap();
-        executor.commit_transaction(result).unwrap();
+        executor.commit_transaction(result);
     }
     executor.finish().unwrap();
     read_post_state(&mut h)
@@ -288,16 +290,21 @@ fn run_plain(targets: &[Address]) -> PostState {
 
 /// Same as [`run_plain`] but with the multi-gas inspector installed, switching
 /// block execution to revm's inspect path.
-fn run_inspected(targets: &[Address]) -> PostState {
+fn run_inspected(targets: &[Address], sparse: bool) -> PostState {
     let mut h = harness();
     let cfg = ArbEvmConfig::new(Arc::new(ChainSpec::default()));
     let factory = cfg.block_executor_factory();
     let sink = MultiGasSink::default();
-    let evm = factory.evm_factory().create_evm_with_inspector(
-        h.state(),
-        block_env(),
-        MultiGasInspector::with_sink(sink.clone()),
-    );
+    let inspector = MultiGasInspector::with_sink(sink.clone());
+    let evm = if sparse {
+        factory
+            .evm_factory()
+            .create_evm_with_sparse_multigas_inspector(h.state(), block_env(), inspector)
+    } else {
+        factory
+            .evm_factory()
+            .create_evm_with_inspector(h.state(), block_env(), inspector)
+    };
     let mut executor = factory.create_arb_executor(evm, exec_ctx(), CHAIN_ID);
     executor.set_multi_gas_sink(sink);
     executor.arb_ctx.basefee = U256::from(HEADER_BASE_FEE);
@@ -306,20 +313,86 @@ fn run_inspected(targets: &[Address]) -> PostState {
         let result = executor
             .execute_transaction_without_commit(call_tx(*target, nonce as u64))
             .unwrap();
-        executor.commit_transaction(result).unwrap();
+        executor.commit_transaction(result);
     }
     executor.finish().unwrap();
     read_post_state(&mut h)
+}
+
+/// Run one raw EVM call and return the inspector's exact resource vector.
+/// This complements the post-state checks below: those prove consensus state,
+/// while this catches a sparse path that accidentally shifts gas between
+/// resource dimensions without changing the test block's resulting state.
+fn raw_inspector_multigas(target: Address, sparse: bool) -> arb_primitives::multigas::MultiGas {
+    let mut h = harness();
+    let cfg = ArbEvmConfig::new(Arc::new(ChainSpec::default()));
+    let factory = cfg.block_executor_factory();
+    let sink = MultiGasSink::default();
+    let inspector = MultiGasInspector::with_sink(sink.clone());
+    let mut evm = if sparse {
+        factory
+            .evm_factory()
+            .create_evm_with_sparse_multigas_inspector(h.state(), block_env(), inspector)
+    } else {
+        factory
+            .evm_factory()
+            .create_evm_with_inspector(h.state(), block_env(), inspector)
+    };
+    let result = evm
+        .inspect_one_tx(
+            TxEnv::builder()
+                .caller(sender())
+                .call(target)
+                .gas_limit(500_000)
+                .gas_price(1_000_000_000)
+                .nonce(0)
+                .chain_id(Some(CHAIN_ID))
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+    assert!(result.is_success(), "raw inspector call failed: {result:?}");
+    let execution_gas = result.tx_gas_used().saturating_sub(21_000);
+    drop(evm);
+    let mut multi_gas = sink
+        .lock()
+        .take()
+        .expect("outer frame must publish an exact multi-gas vector");
+    // The sparse inspector deliberately omits ordinary computation opcodes;
+    // the block executor fills that aggregate remainder from total gas used.
+    // Apply the same completion here before comparing final resource vectors.
+    let computation_remainder = execution_gas.saturating_sub(multi_gas.single_gas());
+    multi_gas.saturating_increment_into(
+        arb_primitives::multigas::ResourceKind::Computation,
+        computation_remainder,
+    );
+    multi_gas
+}
+
+#[test]
+fn sparse_inspector_preserves_exact_resource_vectors() {
+    for target in [STORE, FACTORY, DISPERSE, FAILED_XFER, OOG_CALLER] {
+        assert_eq!(
+            raw_inspector_multigas(target, false),
+            raw_inspector_multigas(target, true),
+            "sparse inspector changed resource attribution for {target}",
+        );
+    }
 }
 
 /// Each ordering: the inspector path must equal the plain path, and the
 /// transactions must actually have executed (store written, create performed).
 fn assert_equivalent(targets: &[Address], creates: u64) {
     let plain = run_plain(targets);
-    let inspected = run_inspected(targets);
+    let inspected = run_inspected(targets, false);
+    let sparse = run_inspected(targets, true);
     assert_eq!(
         plain, inspected,
         "inspector path diverged from plain path for {targets:?}",
+    );
+    assert_eq!(
+        plain, sparse,
+        "sparse inspector path diverged from plain path for {targets:?}",
     );
     if targets.contains(&STORE) {
         assert_eq!(plain.1, U256::from(1u64), "STORE must have executed");
@@ -362,10 +435,15 @@ fn plain_multi_call_is_consensus_equivalent() {
 #[test]
 fn disperse_value_transfers_is_consensus_equivalent() {
     let plain = run_plain(&[DISPERSE]);
-    let inspected = run_inspected(&[DISPERSE]);
+    let inspected = run_inspected(&[DISPERSE], false);
+    let sparse = run_inspected(&[DISPERSE], true);
     assert_eq!(
         plain, inspected,
         "value-transfer disperse diverged: inspect vs plain",
+    );
+    assert_eq!(
+        plain, sparse,
+        "value-transfer disperse diverged: sparse vs plain",
     );
     assert_eq!(plain.3, U256::from(6u64), "existing EOA received 1 wei");
     assert_eq!(plain.4, U256::from(1u64), "new account received 1 wei");
@@ -383,11 +461,13 @@ fn disperse_value_transfers_is_consensus_equivalent() {
 #[test]
 fn failed_value_transfer_then_call_is_consensus_equivalent() {
     let plain = run_plain(&[FAILED_XFER, STORE]);
-    let inspected = run_inspected(&[FAILED_XFER, STORE]);
+    let inspected = run_inspected(&[FAILED_XFER, STORE], false);
+    let sparse = run_inspected(&[FAILED_XFER, STORE], true);
     assert_eq!(
         plain, inspected,
         "failed transfer diverged: inspect vs plain",
     );
+    assert_eq!(plain, sparse, "failed transfer diverged: sparse vs plain");
     assert_eq!(
         plain.3,
         U256::from(5u64),
@@ -406,11 +486,13 @@ fn failed_value_transfer_then_call_is_consensus_equivalent() {
 #[test]
 fn out_of_gas_sstore_is_consensus_equivalent() {
     let plain = run_plain(&[OOG_CALLER]);
-    let inspected = run_inspected(&[OOG_CALLER]);
+    let inspected = run_inspected(&[OOG_CALLER], false);
+    let sparse = run_inspected(&[OOG_CALLER], true);
     assert_eq!(
         plain, inspected,
         "out-of-gas sstore diverged: inspect vs plain",
     );
+    assert_eq!(plain, sparse, "out-of-gas sstore diverged: sparse vs plain",);
     assert_eq!(
         plain.1,
         U256::ZERO,

@@ -1,10 +1,11 @@
+use crate::{ArbPrecompileOutput as PrecompileOutput, ArbPrecompileResult as PrecompileResult};
 use alloy_evm::precompiles::{DynPrecompile, PrecompileInput};
 use alloy_primitives::{keccak256, Address, Log, B256, U256};
 use alloy_sol_types::{SolError, SolEvent, SolInterface};
 use arb_context::ArbPrecompileCtx;
 use arb_storage::ARBOS_STATE_ADDRESS;
 use arbos::merkle_accumulator::calc_num_partials;
-use revm::precompile::{PrecompileId, PrecompileOutput, PrecompileResult};
+use revm::precompile::PrecompileId;
 use std::sync::Arc;
 
 use crate::{interfaces::IArbSys, ArbPrecompileError};
@@ -52,9 +53,7 @@ pub fn send_merkle_update_topic() -> B256 {
 }
 
 pub fn create_arbsys_precompile(ctx: Arc<ArbPrecompileCtx>) -> DynPrecompile {
-    DynPrecompile::new_stateful(PrecompileId::custom("arbsys"), move |input| {
-        handler(input, &ctx)
-    })
+    crate::new_arb_precompile(PrecompileId::custom("arbsys"), ctx, handler)
 }
 
 fn handler(mut input: PrecompileInput<'_>, ctx: &ArbPrecompileCtx) -> PrecompileResult {

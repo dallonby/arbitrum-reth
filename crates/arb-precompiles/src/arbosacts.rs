@@ -1,8 +1,9 @@
+use crate::ArbPrecompileResult as PrecompileResult;
 use alloy_evm::precompiles::{DynPrecompile, PrecompileInput};
 use alloy_primitives::Address;
 use alloy_sol_types::{SolError, SolInterface};
 use arb_context::ArbPrecompileCtx;
-use revm::precompile::{PrecompileId, PrecompileResult};
+use revm::precompile::PrecompileId;
 use std::sync::Arc;
 
 use crate::interfaces::IArbosActs;
@@ -14,9 +15,7 @@ pub const ARBOSACTS_ADDRESS: Address = Address::new([
 ]);
 
 pub fn create_arbosacts_precompile(ctx: Arc<ArbPrecompileCtx>) -> DynPrecompile {
-    DynPrecompile::new_stateful(PrecompileId::custom("arbosacts"), move |input| {
-        handler(input, &ctx)
-    })
+    crate::new_arb_precompile(PrecompileId::custom("arbosacts"), ctx, handler)
 }
 
 /// Every method is invoked by ArbOS internally, never by an EVM caller, so a

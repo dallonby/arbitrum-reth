@@ -1,8 +1,9 @@
+use crate::{ArbPrecompileOutput as PrecompileOutput, ArbPrecompileResult as PrecompileResult};
 use alloy_evm::precompiles::{DynPrecompile, PrecompileInput};
 use alloy_primitives::{Address, U256};
 use alloy_sol_types::SolInterface;
 use arb_context::ArbPrecompileCtx;
-use revm::precompile::{PrecompileId, PrecompileOutput, PrecompileResult};
+use revm::precompile::PrecompileId;
 use std::sync::Arc;
 
 use crate::{interfaces::IArbInfo, ArbPrecompileError};
@@ -16,9 +17,7 @@ pub const ARBINFO_ADDRESS: Address = Address::new([
 const COPY_GAS: u64 = 3;
 
 pub fn create_arbinfo_precompile(ctx: Arc<ArbPrecompileCtx>) -> DynPrecompile {
-    DynPrecompile::new_stateful(PrecompileId::custom("arbinfo"), move |input| {
-        handler(input, &ctx)
-    })
+    crate::new_arb_precompile(PrecompileId::custom("arbinfo"), ctx, handler)
 }
 
 fn handler(mut input: PrecompileInput<'_>, ctx: &ArbPrecompileCtx) -> PrecompileResult {

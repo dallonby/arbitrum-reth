@@ -55,6 +55,7 @@ fn execute_call(
         ommers: &[],
         withdrawals: None,
         extra_data: vec![0u8; 32].into(),
+        slot_number: None,
     };
 
     let mut executor = cfg
@@ -88,9 +89,7 @@ fn execute_call(
         } => b.clone(),
         _ => Bytes::new(),
     };
-    executor
-        .commit_transaction(result)
-        .map_err(|e| format!("commit: {e}"))?;
+    executor.commit_transaction(result);
     let _ = executor.finish().map_err(|e| format!("finish: {e}"))?;
     Ok((success, output))
 }

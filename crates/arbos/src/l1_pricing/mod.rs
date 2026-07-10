@@ -75,7 +75,7 @@ pub struct L1PricingState<'a, D> {
     pub arbos_version: u64,
 }
 
-pub fn initialize_l1_pricing_state<D: revm::Database, B: StorageBackend>(
+pub fn initialize_l1_pricing_state<D, B: StorageBackend>(
     sto: &Storage<'_, D>,
     backend: &mut B,
     rewards_recipient: Address,
@@ -479,7 +479,7 @@ impl<'a, D> L1PricingState<'a, D> {
     }
 }
 
-impl<D: revm::Database> L1PricingState<'_, D> {
+impl<D> L1PricingState<'_, D> {
     pub fn initialize<B: StorageBackend>(
         sto: &Storage<'_, D>,
         backend: &mut B,

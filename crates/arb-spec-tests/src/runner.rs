@@ -15,6 +15,12 @@ use crate::{
 
 pub const RPC_URL_ENV: &str = "ARB_SPEC_RPC_URL";
 pub const BINARY_ENV: &str = "ARB_SPEC_BINARY";
+/// Selects the storage layout for binary-driven fixtures. Defaults to V2 so
+/// every Reth 2.3 regression run exercises the production storage layout.
+pub const STORAGE_V2_ENV: &str = "ARB_SPEC_STORAGE_V2";
+/// Enables the deliberately non-canonical root-free producer for isolated
+/// binary-driven diagnostics.
+pub const SKIP_STATE_ROOT_ENV: &str = "ARB_SPEC_SKIP_STATE_ROOT_VALIDATION";
 /// When set, the harness panics rather than skipping any binary-driven
 /// fixture. CI sets this together with `--features spec-binary` so a
 /// missing/misnamed binary fails the job loudly instead of silently
@@ -208,6 +214,15 @@ impl SpawnedNode {
         let log_err = log_file
             .try_clone()
             .map_err(|e| SpecError::Action(format!("clone log fd: {e}")))?;
+        let storage_v2 = match std::env::var(STORAGE_V2_ENV) {
+            Ok(value) if value == "true" || value == "false" => value,
+            Ok(value) => {
+                return Err(SpecError::Action(format!(
+                    "{STORAGE_V2_ENV} must be `true` or `false`, got `{value}`"
+                )))
+            }
+            Err(_) => "true".to_string(),
+        };
         let mut cmd = Command::new(binary);
         cmd.env(
             "RUST_LOG",
@@ -219,8 +234,7 @@ impl SpawnedNode {
                 cmd.env(var, v);
             }
         }
-        let child = cmd
-            .arg("node")
+        cmd.arg("node")
             .arg(format!("--chain={}", chain_path.display()))
             .arg(format!("--datadir={}", workdir.join("db").display()))
             .arg("--http")
@@ -231,7 +245,14 @@ impl SpawnedNode {
             .arg(format!("--authrpc.port={auth_port}"))
             .arg(format!("--authrpc.jwtsecret={}", jwt_path.display()))
             .arg("--disable-discovery")
+            .arg("--port=0")
+            .arg("--ipcdisable")
             .arg("--db.exclusive=true")
+            .arg(format!("--storage.v2={storage_v2}"));
+        if std::env::var(SKIP_STATE_ROOT_ENV).is_ok() {
+            cmd.arg("--engine.skip-state-root-validation");
+        }
+        let child = cmd
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_err))
             .spawn()

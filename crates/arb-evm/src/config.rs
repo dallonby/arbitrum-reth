@@ -143,6 +143,7 @@ where
             } else {
                 None
             },
+            slot_num: 0,
         };
 
         Ok(EvmEnv { cfg_env, block_env })
@@ -192,6 +193,7 @@ where
             } else {
                 None
             },
+            slot_num: 0,
         };
 
         Ok(EvmEnv { cfg_env, block_env })
@@ -213,6 +215,7 @@ where
             ommers: &[],
             withdrawals: None,
             extra_data: extra.into(),
+            slot_number: None,
         })
     }
 
@@ -228,6 +231,7 @@ where
             ommers: &[],
             withdrawals: None,
             extra_data: attributes.extra_data,
+            slot_number: None,
         })
     }
 }
@@ -279,6 +283,7 @@ where
             } else {
                 None
             },
+            slot_num: 0,
         };
 
         Ok(EvmEnv { cfg_env, block_env })
@@ -295,6 +300,7 @@ where
             ommers: &[],
             withdrawals: None,
             extra_data: payload.payload.as_v1().extra_data.clone(),
+            slot_number: None,
         })
     }
 

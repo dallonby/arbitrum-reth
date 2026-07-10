@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use alloy_consensus::Header;
-use arb_node::{args::RollupArgs, consensus::ArbConsensus};
+use arb_node::{
+    args::{RollupArgs, StateRootAlgorithm},
+    consensus::ArbConsensus,
+};
 use clap::Parser;
 use reth_chainspec::ChainSpec;
 use reth_consensus::HeaderValidator;
@@ -34,6 +37,30 @@ fn rollup_args_omit_sequencer_stays_false() {
 #[test]
 fn rollup_args_invalid_flag_errors() {
     assert!(TestCli::try_parse_from(["test", "--rollup.unknown"]).is_err());
+}
+
+#[test]
+fn state_root_args_default_to_canonical_parallel() {
+    let args = RollupArgs::default();
+    assert!(!args.skip_state_root_validation);
+    assert_eq!(args.state_root_algorithm, StateRootAlgorithm::Parallel);
+    assert_eq!(args.state_root_verify_every, 0);
+}
+
+#[test]
+fn state_root_fast_mode_and_verifier_parse() {
+    let cli = TestCli::try_parse_from([
+        "test",
+        "--engine.skip-state-root-validation",
+        "--engine.state-root-algorithm",
+        "serial",
+        "--engine.state-root-verify-every",
+        "128",
+    ])
+    .expect("parse state-root options");
+    assert!(cli.rollup.skip_state_root_validation);
+    assert_eq!(cli.rollup.state_root_algorithm, StateRootAlgorithm::Serial);
+    assert_eq!(cli.rollup.state_root_verify_every, 128);
 }
 
 // ==== ArbConsensus (no-op, always Ok) ====

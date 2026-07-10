@@ -4,13 +4,13 @@ use alloy_sol_types::{SolError, SolEvent, SolInterface};
 use arb_context::ArbPrecompileCtx;
 use arb_storage::ARBOS_STATE_ADDRESS;
 
-use revm::{
-    precompile::{PrecompileId, PrecompileOutput, PrecompileResult},
-    primitives::Log,
-};
+use revm::{precompile::PrecompileId, primitives::Log};
 use std::sync::Arc;
 
-use crate::{interfaces::IArbDebug, ArbPrecompileError};
+use crate::{
+    interfaces::IArbDebug, ArbPrecompileError, ArbPrecompileOutput as PrecompileOutput,
+    ArbPrecompileResult as PrecompileResult,
+};
 
 /// ArbDebug precompile address (0xff).
 pub const ARBDEBUG_ADDRESS: Address = Address::new([
@@ -26,9 +26,7 @@ const LOG_TOPIC_GAS: u64 = 375;
 const LOG_DATA_GAS: u64 = 8;
 
 pub fn create_arbdebug_precompile(ctx: Arc<ArbPrecompileCtx>) -> DynPrecompile {
-    DynPrecompile::new_stateful(PrecompileId::custom("arbdebug"), move |input| {
-        handler(input, &ctx)
-    })
+    crate::new_arb_precompile(PrecompileId::custom("arbdebug"), ctx, handler)
 }
 
 fn handler(mut input: PrecompileInput<'_>, ctx: &ArbPrecompileCtx) -> PrecompileResult {

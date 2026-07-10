@@ -3,7 +3,7 @@ use alloy_eips::eip2718::{Encodable2718, Typed2718};
 use alloy_evm::{
     block::{
         BlockExecutionError, BlockExecutionResult, BlockExecutor, BlockExecutorFactory,
-        BlockExecutorFor, ExecutableTx, OnStateHook,
+        ExecutableTx, GasOutput, StateDB,
     },
     eth::{
         receipt_builder::ReceiptBuilder, spec::EthExecutorSpec, EthBlockExecutionCtx,
@@ -19,8 +19,9 @@ use arb_primitives::{
     signed_tx::ArbTransactionExt,
     tx_types::ArbTxType,
 };
+use arb_storage::{Detached, StateDbBackend};
 use arbos::{
-    arbos_state::ArbosState,
+    arbos_state::{arbos_from_input_system, ArbosState},
     burn::SystemBurner,
     internal_tx::{self, InternalTxContext},
     l1_pricing, retryables,
@@ -30,11 +31,15 @@ use arbos::{
     },
     util::{self as arb_util, tx_type_has_poster_costs, BalanceError},
 };
-use reth_evm::TransactionEnv;
+use reth_evm::TransactionEnvMut;
 use revm::{
-    context::{result::ExecutionResult, TxEnv},
+    context::{
+        result::{ExecutionResult, ResultGas},
+        TxEnv,
+    },
     database::State,
     inspector::Inspector,
+    Database as RevmDatabase,
 };
 
 use crate::{
@@ -47,8 +52,8 @@ use crate::{
 /// Extension trait for transaction environments that support gas price mutation.
 ///
 /// Arbitrum needs to cap the gas price to the base fee when dropping tips,
-/// which requires mutating fields not exposed by the standard `TransactionEnv` trait.
-pub trait ArbTransactionEnv: TransactionEnv {
+/// which requires mutating fields not exposed by the standard `TransactionEnvMut` trait.
+pub trait ArbTransactionEnv: TransactionEnvMut {
     /// Set the effective gas price (max_fee_per_gas for EIP-1559, gas_price for legacy).
     fn set_gas_price(&mut self, gas_price: u128);
     /// Set the max priority fee per gas (tip cap).
@@ -161,6 +166,7 @@ impl<R, Spec, EvmF> ArbBlockExecutorFactory<R, Spec, EvmF> {
             // through the same `Arc<ArbPrecompileCtx>`.
             precompile_ctx: self.evm_factory.staged_precompile_ctx().unwrap_or_default(),
             pending_tx: None,
+            deferred_error: None,
             block_gas_left: 0,
             user_txs_processed: 0,
             gas_used_for_l1: Vec::new(),
@@ -188,12 +194,17 @@ where
                     + FromTxWithEncoded<R::Transaction>
                     + ArbTransactionEnv,
         > + crate::evm::ArbEvmFactoryStaged,
+    <R::Transaction as TransactionEnvelope>::TxType: Send + 'static,
     Self: 'static,
 {
     type EvmFactory = EvmF;
     type ExecutionCtx<'a> = EthBlockExecutionCtx<'a>;
     type Transaction = R::Transaction;
     type Receipt = R::Receipt;
+    type TxExecutionResult =
+        EthTxResult<EvmF::HaltReason, <R::Transaction as TransactionEnvelope>::TxType>;
+    type Executor<'a, DB: StateDB, I: Inspector<EvmF::Context<DB>>> =
+        ArbBlockExecutor<'a, EvmF::Evm<DB, I>, &'a Spec, &'a R>;
 
     fn evm_factory(&self) -> &Self::EvmFactory {
         &self.evm_factory
@@ -201,12 +212,12 @@ where
 
     fn create_executor<'a, DB, I>(
         &'a self,
-        evm: EvmF::Evm<&'a mut State<DB>, I>,
+        evm: EvmF::Evm<DB, I>,
         ctx: Self::ExecutionCtx<'a>,
-    ) -> impl BlockExecutorFor<'a, Self, DB, I>
+    ) -> Self::Executor<'a, DB, I>
     where
-        DB: Database + 'a,
-        I: Inspector<EvmF::Context<&'a mut State<DB>>> + 'a,
+        DB: StateDB,
+        I: Inspector<EvmF::Context<DB>>,
     {
         let extra_bytes = ctx.extra_data.as_ref();
         let (delayed_messages_read, l2_block_number) = decode_extra_fields(extra_bytes);
@@ -230,6 +241,7 @@ where
             )
             .unwrap_or_default(),
             pending_tx: None,
+            deferred_error: None,
             block_gas_left: 0,
             user_txs_processed: 0,
             gas_used_for_l1: Vec::new(),
@@ -300,6 +312,10 @@ pub struct ArbBlockExecutor<'a, Evm, Spec, R: ReceiptBuilder> {
     pub precompile_ctx: std::sync::Arc<arb_context::ArbPrecompileCtx>,
     /// Per-tx state between execute and commit.
     pending_tx: Option<PendingArbTx>,
+    /// Alloy EVM 0.36 makes state commit infallible at the trait boundary.
+    /// ArbOS post-commit reads can still fail, so retain the first failure and
+    /// surface it from the next execute call or block finish.
+    deferred_error: Option<BlockExecutionError>,
     /// Remaining block gas for rate limiting.
     /// Starts at per_block_gas_limit and decreases with each tx's compute gas.
     pub block_gas_left: u64,
@@ -401,12 +417,12 @@ impl<'a, Evm, Spec, R: ReceiptBuilder> ArbBlockExecutor<'a, Evm, Spec, R> {
 /// and create/update the hooks. Pulled out of [`ArbBlockExecutor`] so it
 /// can borrow only the fields it mutates, leaving the rest of `self`
 /// (notably the executor's `inner.db_mut()`) free for concurrent reborrow.
-fn load_state_params<D: Database>(
+fn load_state_params<D: StateDB + arb_storage::SystemStateBackend>(
     arb_ctx: &mut ArbBlockExecutionCtx,
     precompile_ctx: &mut std::sync::Arc<arb_context::ArbPrecompileCtx>,
     arb_hooks: &mut Option<DefaultArbOsHooks>,
-    state: &mut revm::database::State<D>,
-    arb_state: &ArbosState<D, impl arbos::burn::Burner>,
+    state: &mut D,
+    arb_state: &ArbosState<Detached, impl arbos::burn::Burner>,
 ) {
     let arbos_version = arb_state.arbos_version();
     arb_ctx.arbos_version = arbos_version;
@@ -515,11 +531,11 @@ fn populate_l2_block_hash_window(
     }
 }
 
-impl<'db, DB, E, Spec, R> ArbBlockExecutor<'_, E, Spec, R>
+impl<DB, E, Spec, R> ArbBlockExecutor<'_, E, Spec, R>
 where
-    DB: Database + 'db,
+    DB: StateDB,
     E: Evm<
-        DB = &'db mut State<DB>,
+        DB = DB,
         Tx: FromRecoveredTx<R::Transaction> + FromTxWithEncoded<R::Transaction> + ArbTransactionEnv,
     >,
     Spec: EthExecutorSpec,
@@ -528,6 +544,7 @@ where
         Receipt: TxReceipt<Log = Log>,
     >,
     R::Transaction: TransactionEnvelope,
+    <R::Transaction as TransactionEnvelope>::TxType: Send + 'static,
 {
     /// Re-read the per-tx ArbOS state parameters from committed state into the
     /// cached context and hooks: the fee collectors, minimum base fee, brotli
@@ -542,10 +559,10 @@ where
             .as_ref()
             .map(|h| h.collect_tips_enabled)
             .unwrap_or(false);
-        let db: &mut State<DB> = self.inner.evm_mut().db_mut();
-        if let Ok(arb_state) = ArbosState::open(db, SystemBurner::new(None, false)) {
+        let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
+        if let Ok(arb_state) = arbos_from_input_system(db, SystemBurner::new(None, false)) {
             // SAFETY: see `Storage::state_mut()` invariant.
-            let state_ref = unsafe { arb_state.backing_storage.state_mut() };
+            let state_ref = &mut *db;
             if let Ok(net) = arb_state.network_fee_account(state_ref) {
                 self.arb_ctx.network_fee_account = net;
             }
@@ -596,14 +613,18 @@ where
         // filtered funds recipient. The retryable is still created but
         // auto-redeem scheduling is skipped.
         let is_filtered = {
-            let db: &mut State<DB> = self.inner.evm_mut().db_mut();
-            let arb_state = ArbosState::open(db, SystemBurner::new(None, false))
+            let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
+            let arb_state = arbos_from_input_system(db, SystemBurner::new(None, false))
                 .map_err(BlockExecutionError::other)?;
-            if arb_state.filtered_transactions.is_filtered_free(ticket_id) {
+            if arb_state
+                .filtered_transactions
+                .is_filtered(db, ticket_id)
+                .unwrap_or(false)
+            {
                 // SAFETY: see `Storage::state_mut()` invariant. `arb_state` borrows
                 // the state for `'a`; `state_mut()` re-materialises that borrow
                 // for one accessor call.
-                let state_ref = unsafe { arb_state.backing_storage.state_mut() };
+                let state_ref = &mut *db;
                 let recipient = arb_state
                     .filtered_funds_recipient_or_default(state_ref)
                     .map_err(BlockExecutionError::other)?;
@@ -621,7 +642,7 @@ where
         let effective_base_fee = self.arb_ctx.basefee;
 
         let overlay = &mut self.state_overlay;
-        let db: &mut State<DB> = self.inner.evm_mut().db_mut();
+        let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
 
         // Mint deposit value to sender.
         let _ = arb_util::mint_balance(&sender, info.deposit_value, |f, t, a| {
@@ -634,14 +655,7 @@ where
         self.expected_balance_delta = self.expected_balance_delta.saturating_add(dep_i128);
 
         // Get sender balance after minting.
-        let _ = db.load_cache_account(sender);
-        let balance_after_mint = db
-            .cache
-            .accounts
-            .get(&sender)
-            .and_then(|a| a.account.as_ref())
-            .map(|a| a.info.balance)
-            .unwrap_or(U256::ZERO);
+        let balance_after_mint = get_balance(db, sender);
 
         let params = SubmitRetryableParams {
             ticket_id,
@@ -696,8 +710,9 @@ where
             return Ok(EthTxResult {
                 result: revm::context::result::ResultAndState {
                     result: ExecutionResult::Revert {
-                        gas_used: 0,
+                        gas: synthetic_result_gas(0, 0),
                         output: alloy_primitives::Bytes::new(),
+                        logs: Vec::new(),
                     },
                     state: Default::default(),
                 },
@@ -707,7 +722,7 @@ where
         }
 
         let overlay = &mut self.state_overlay;
-        let db: &mut State<DB> = self.inner.evm_mut().db_mut();
+        let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
 
         // 3. Transfer submission fee to network fee account.
         if !fees.submission_fee.is_zero() {
@@ -787,8 +802,9 @@ where
             return Ok(EthTxResult {
                 result: revm::context::result::ResultAndState {
                     result: ExecutionResult::Revert {
-                        gas_used: 0,
+                        gas: synthetic_result_gas(0, 0),
                         output: alloy_primitives::Bytes::new(),
+                        logs: Vec::new(),
                     },
                     state: Default::default(),
                 },
@@ -807,10 +823,10 @@ where
         }
 
         // 6. Create retryable ticket.
-        let arb_state = ArbosState::open(db, SystemBurner::new(None, false))
+        let arb_state = arbos_from_input_system(db, SystemBurner::new(None, false))
             .map_err(BlockExecutionError::other)?;
         // SAFETY: see `Storage::state_mut()` invariant.
-        let state_ref = unsafe { arb_state.backing_storage.state_mut() };
+        let state_ref = &mut *db;
         let _ = arb_state.retryable_state.create_retryable(
             state_ref,
             ticket_id,
@@ -833,7 +849,7 @@ where
         });
 
         let overlay = &mut self.state_overlay;
-        let db: &mut State<DB> = self.inner.evm_mut().db_mut();
+        let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
 
         // 7. Handle gas fees if user can pay.
         if fees.can_pay_for_gas {
@@ -874,10 +890,10 @@ where
             if !is_filtered {
                 // Schedule auto-redeem: reconstruct the retry tx from stored
                 // fields and bump num_tries.
-                let arb_state = ArbosState::open(db, SystemBurner::new(None, false))
+                let arb_state = arbos_from_input_system(db, SystemBurner::new(None, false))
                     .map_err(BlockExecutionError::other)?;
                 // SAFETY: see `Storage::state_mut()` invariant.
-                let state_ref = unsafe { arb_state.backing_storage.state_mut() };
+                let state_ref = &mut *db;
                 match arb_state
                     .retryable_state
                     .open_retryable(state_ref, ticket_id, 0)
@@ -1012,8 +1028,9 @@ where
             Ok(EthTxResult {
                 result: revm::context::result::ResultAndState {
                     result: ExecutionResult::Revert {
-                        gas_used,
+                        gas: synthetic_result_gas(gas_used, 0),
                         output: ticket_bytes,
+                        logs: Vec::new(),
                     },
                     state: Default::default(),
                 },
@@ -1025,8 +1042,7 @@ where
                 result: revm::context::result::ResultAndState {
                     result: ExecutionResult::Success {
                         reason: revm::context::result::SuccessReason::Return,
-                        gas_used,
-                        gas_refunded: 0,
+                        gas: synthetic_result_gas(gas_used, 0),
                         output: revm::context::result::Output::Call(ticket_bytes),
                         logs: receipt_logs,
                     },
@@ -1039,11 +1055,11 @@ where
     }
 }
 
-impl<'db, DB, E, Spec, R> BlockExecutor for ArbBlockExecutor<'_, E, Spec, R>
+impl<DB, E, Spec, R> BlockExecutor for ArbBlockExecutor<'_, E, Spec, R>
 where
-    DB: Database + 'db,
+    DB: StateDB,
     E: Evm<
-        DB = &'db mut State<DB>,
+        DB = DB,
         Tx: FromRecoveredTx<R::Transaction> + FromTxWithEncoded<R::Transaction> + ArbTransactionEnv,
     >,
     Spec: EthExecutorSpec,
@@ -1052,6 +1068,7 @@ where
         Receipt: TxReceipt<Log = Log> + arb_primitives::SetArbReceiptFields,
     >,
     R::Transaction: TransactionEnvelope,
+    <R::Transaction as TransactionEnvelope>::TxType: Send + 'static,
 {
     type Transaction = R::Transaction;
     type Receipt = R::Receipt;
@@ -1098,12 +1115,12 @@ where
         // Load ArbOS state parameters from the EVM database.
         // Block-start operations (pricing model update, retryable reaping, etc.)
         // are triggered by the startBlock internal tx, NOT here.
-        let db: &mut State<DB> = self.inner.evm_mut().db_mut();
-        let arb_state = ArbosState::open(db, SystemBurner::new(None, false))
+        let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
+        let arb_state = arbos_from_input_system(db, SystemBurner::new(None, false))
             .map_err(BlockExecutionError::other)?;
         // SAFETY: see `Storage::state_mut()` invariant. The returned reference
         // inherits the storage handle's `'a` lifetime, decoupled from `&arb_state`.
-        let state_ref = unsafe { arb_state.backing_storage.state_mut() };
+        let state_ref = &mut *db;
 
         let _ = arb_state.l2_pricing_state.commit_multi_gas_fees(state_ref);
 
@@ -1124,16 +1141,16 @@ where
             .per_block_gas_limit(state_ref)
             .unwrap_or(0);
 
+        let mut l1_block_hashes = Vec::new();
         if let Ok(l1_block_number) = arb_state.blockhashes.l1_block_number(state_ref) {
             let lower = l1_block_number.saturating_sub(256);
             for n in lower..l1_block_number {
-                // Reborrow `state_ref` for the read; the borrow ends before
-                // the subsequent `block_hashes.insert` writes to the cache.
                 if let Ok(Some(hash)) = arb_state.blockhashes.block_hash(state_ref, n) {
-                    state_ref.block_hashes.insert(n, hash);
+                    l1_block_hashes.push((n, hash));
                 }
             }
         }
+        crate::evm::replace_l1_block_hashes(l1_block_hashes);
 
         // L2 block hashes for arbBlockHash(): parent from the header, deeper
         // committed ancestors from the state provider. The producer additionally
@@ -1143,7 +1160,7 @@ where
             let current_l2 = self.arb_ctx.l2_block_number;
             let block = std::sync::Arc::clone(&self.precompile_ctx.block);
             populate_l2_block_hash_window(&block, current_l2, parent_hash, |n| {
-                match state_ref.database.block_hash(n) {
+                match state_ref.block_hash(n) {
                     Ok(hash) if hash != B256::ZERO => Some(hash),
                     _ => None,
                 }
@@ -1168,6 +1185,9 @@ where
         &mut self,
         tx: impl ExecutableTx<Self>,
     ) -> Result<Self::Result, BlockExecutionError> {
+        if let Some(err) = self.deferred_error.take() {
+            return Err(err);
+        }
         // Decompose the transaction to extract sender, type, and gas limit.
         let (tx_env, recovered) = tx.into_parts();
         let sender = *recovered.signer();
@@ -1287,16 +1307,14 @@ where
                         revm::context::Block::timestamp(block).to::<u64>(),
                     )
                 };
-                let db: &mut State<DB> = self.inner.evm_mut().db_mut();
-                let mut arb_state = ArbosState::open(db, SystemBurner::new(None, false))
+                let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
+                let mut arb_state = arbos_from_input_system(db, SystemBurner::new(None, false))
                     .map_err(BlockExecutionError::other)?;
-                // SAFETY: see `Storage::state_mut()` invariant. A second handle
-                // (`closure_storage`) is taken so the closures below can
-                // re-materialise the state borrow on demand alongside the
-                // outer `apply_internal_tx_update` call. The Storage type's
-                // single-threaded sequential invariant is upheld because all
-                // accessors run on the same thread without interleaving.
-                let closure_storage = arb_state.backing_storage.clone();
+                // The internal-tx API takes the state backend and transfer/balance
+                // callbacks together. They execute synchronously, so a raw pointer
+                // lets each callback reborrow the same generic StateDB without
+                // requiring the old concrete `State<DB>` storage handle.
+                let db_ptr: *mut StateDbBackend<DB> = db;
                 let ctx = InternalTxContext {
                     block_number,
                     current_time,
@@ -1307,12 +1325,7 @@ where
                 if is_start_block
                     && arb_state.arbos_version() >= arb_chainspec::arbos_version::ARBOS_VERSION_40
                 {
-                    // SAFETY: see `Storage::state_mut()` invariant.
-                    process_parent_block_hash(
-                        unsafe { closure_storage.state_mut() },
-                        self.arb_ctx.l2_block_number,
-                        ctx.prev_hash,
-                    );
+                    process_parent_block_hash(db, self.arb_ctx.l2_block_number, ctx.prev_hash);
                 }
 
                 let touched_ptr = &mut self.touched_accounts as *mut rustc_hash::FxHashSet<Address>;
@@ -1320,12 +1333,11 @@ where
                 let finalise_ptr = &self.finalise_deleted as *const rustc_hash::FxHashSet<Address>;
                 let overlay_ptr = &mut self.state_overlay as *mut StateOverlay;
                 let arbos_ver = self.arb_ctx.arbos_version;
-                let transfer_storage = closure_storage.clone();
-                let balance_storage = closure_storage.clone();
                 let mut do_transfer = move |from: Address, to: Address, amount: U256| {
-                    // SAFETY: see `Storage::state_mut()` invariant.
+                    // SAFETY: callbacks are invoked sequentially by
+                    // `apply_internal_tx_update`; no two DB borrows overlap.
                     unsafe {
-                        let state = transfer_storage.state_mut();
+                        let state = &mut *db_ptr;
                         if amount.is_zero()
                             && arbos_ver < arb_chainspec::arbos_version::ARBOS_VERSION_STYLUS
                         {
@@ -1361,16 +1373,13 @@ where
                     Ok(())
                 };
                 let mut do_balance = move |addr: Address| -> U256 {
-                    // SAFETY: see `Storage::state_mut()` invariant.
-                    unsafe { get_balance(balance_storage.state_mut(), addr) }
+                    // SAFETY: callbacks are synchronous and non-overlapping.
+                    unsafe { get_balance(&mut *db_ptr, addr) }
                 };
-                // SAFETY: see `Storage::state_mut()` invariant. The state
-                // handed to `apply_internal_tx_update` and the one materialised
-                // inside `do_transfer`/`do_balance` alias at the type level but
-                // do not overlap at runtime — `apply_internal_tx_update` runs
-                // sequentially on a single thread.
+                // SAFETY: the callback reborrows occur only while this outer
+                // borrow is suspended inside the synchronous callback calls.
                 if let Err(e) = internal_tx::apply_internal_tx_update(
-                    unsafe { closure_storage.state_mut() },
+                    unsafe { &mut *db_ptr },
                     &tx_data,
                     &mut arb_state,
                     &ctx,
@@ -1387,7 +1396,7 @@ where
 
                 if is_start_block {
                     // SAFETY: see `Storage::state_mut()` invariant.
-                    let state_ref = unsafe { arb_state.backing_storage.state_mut() };
+                    let state_ref = &mut *db;
                     if let Ok(l1_block_number) = arb_state.blockhashes.l1_block_number(state_ref) {
                         self.arb_ctx.l1_block_number = l1_block_number;
                     }
@@ -1402,11 +1411,13 @@ where
 
                     if let Ok(l1_block_number) = arb_state.blockhashes.l1_block_number(state_ref) {
                         let lower = l1_block_number.saturating_sub(256);
+                        let mut l1_block_hashes = Vec::new();
                         for n in lower..l1_block_number {
                             if let Ok(Some(hash)) = arb_state.blockhashes.block_hash(state_ref, n) {
-                                state_ref.block_hashes.insert(n, hash);
+                                l1_block_hashes.push((n, hash));
                             }
                         }
+                        crate::evm::replace_l1_block_hashes(l1_block_hashes);
                     }
                 }
             }
@@ -1437,8 +1448,7 @@ where
                 result: revm::context::result::ResultAndState {
                     result: ExecutionResult::Success {
                         reason: revm::context::result::SuccessReason::Return,
-                        gas_used: 0,
-                        gas_refunded: 0,
+                        gas: synthetic_result_gas(0, 0),
                         output: revm::context::result::Output::Call(alloy_primitives::Bytes::new()),
                         logs: Vec::new(),
                     },
@@ -1467,12 +1477,16 @@ where
             // we must check here instead.
             let mut is_filtered = false;
             {
-                let db: &mut State<DB> = self.inner.evm_mut().db_mut();
-                let arb_state = ArbosState::open(db, SystemBurner::new(None, false))
+                let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
+                let arb_state = arbos_from_input_system(db, SystemBurner::new(None, false))
                     .map_err(BlockExecutionError::other)?;
-                if arb_state.filtered_transactions.is_filtered_free(tx_hash) {
+                if arb_state
+                    .filtered_transactions
+                    .is_filtered(db, tx_hash)
+                    .unwrap_or(false)
+                {
                     // SAFETY: see `Storage::state_mut()` invariant.
-                    let state_ref = unsafe { arb_state.backing_storage.state_mut() };
+                    let state_ref = &mut *db;
                     to = arb_state
                         .filtered_funds_recipient_or_default(state_ref)
                         .map_err(BlockExecutionError::other)?;
@@ -1481,7 +1495,7 @@ where
             }
 
             let overlay = &mut self.state_overlay;
-            let db: &mut State<DB> = self.inner.evm_mut().db_mut();
+            let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
             let _ = arb_util::mint_balance(&sender, value, |f, t, a| {
                 apply_balance_op(db, overlay, f, t, a)
             });
@@ -1516,14 +1530,14 @@ where
             // are still committed.
             let result = if is_filtered {
                 ExecutionResult::Revert {
-                    gas_used: 0,
+                    gas: synthetic_result_gas(0, 0),
                     output: alloy_primitives::Bytes::from("filtered transaction"),
+                    logs: Vec::new(),
                 }
             } else {
                 ExecutionResult::Success {
                     reason: revm::context::result::SuccessReason::Return,
-                    gas_used: 0,
-                    gas_refunded: 0,
+                    gas: synthetic_result_gas(0, 0),
                     output: revm::context::result::Output::Call(alloy_primitives::Bytes::new()),
                     logs: Vec::new(),
                 }
@@ -1560,15 +1574,15 @@ where
                     revm::context::Block::timestamp(block).to::<u64>()
                 };
                 let overlay = &mut self.state_overlay;
-                let db: &mut State<DB> = self.inner.evm_mut().db_mut();
+                let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
 
                 // Open the retryable ticket. Scoped so `arb_state`'s borrow of
                 // `db` is released before the balance-op closures below reborrow it.
                 let retryable = {
-                    let arb_state = ArbosState::open(db, SystemBurner::new(None, false))
+                    let arb_state = arbos_from_input_system(db, SystemBurner::new(None, false))
                         .map_err(BlockExecutionError::other)?;
                     // SAFETY: see `Storage::state_mut()` invariant.
-                    let state_ref = unsafe { arb_state.backing_storage.state_mut() };
+                    let state_ref = &mut *db;
                     arb_state
                         .retryable_state
                         .open_retryable(state_ref, info.ticket_id, current_time)
@@ -1627,8 +1641,9 @@ where
                             return Ok(EthTxResult {
                                 result: revm::context::result::ResultAndState {
                                     result: ExecutionResult::Revert {
-                                        gas_used: 0,
+                                        gas: synthetic_result_gas(0, 0),
                                         output: alloy_primitives::Bytes::new(),
+                                        logs: Vec::new(),
                                     },
                                     state: Default::default(),
                                 },
@@ -1655,12 +1670,9 @@ where
                         });
                         retry_pre_exec_undo = Some((sender, prepaid, escrow, value));
 
-                        // Record the pre-exec synthetic credits (escrow value +
-                        // prepaid gas) as transitions now. The EVM's own commit
-                        // would otherwise capture the transient prepaid mint as
-                        // the revert baseline of a freshly-created redeemer,
-                        // corrupting the account changeset and the stateRoot.
-                        overlay.drain_and_apply(db, &self.zombie_accounts);
+                        // Generic StateDB mutations above commit their own
+                        // transitions immediately, so the synthetic credits are
+                        // already visible to the EVM with the correct baseline.
 
                         // Set retry context for end-tx processing.
                         if let Some(hooks) = self.arb_hooks.as_mut() {
@@ -1699,8 +1711,9 @@ where
                         return Ok(EthTxResult {
                             result: revm::context::result::ResultAndState {
                                 result: ExecutionResult::Revert {
-                                    gas_used: 0,
+                                    gas: synthetic_result_gas(0, 0),
                                     output: alloy_primitives::Bytes::from(err_msg.into_bytes()),
+                                    logs: Vec::new(),
                                 },
                                 state: Default::default(),
                             },
@@ -1729,11 +1742,12 @@ where
                         return Ok(EthTxResult {
                             result: revm::context::result::ResultAndState {
                                 result: ExecutionResult::Revert {
-                                    gas_used: 0,
+                                    gas: synthetic_result_gas(0, 0),
                                     output: alloy_primitives::Bytes::from(
                                         format!("error opening retryable {}", info.ticket_id,)
                                             .into_bytes(),
                                     ),
+                                    logs: Vec::new(),
                                 },
                                 state: Default::default(),
                             },
@@ -1828,19 +1842,20 @@ where
         // ArbosState handle.
         let tx_hash_for_filter = recovered.tx().trie_hash();
         let is_filtered = {
-            let db: &mut State<DB> = self.inner.evm_mut().db_mut();
-            let arb_state = ArbosState::open(db, SystemBurner::new(None, false))
+            let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
+            let arb_state = arbos_from_input_system(db, SystemBurner::new(None, false))
                 .map_err(BlockExecutionError::other)?;
             if calldata_units > 0 {
                 // SAFETY: see `Storage::state_mut()` invariant.
-                let state_ref = unsafe { arb_state.backing_storage.state_mut() };
+                let state_ref = &mut *db;
                 let _ = arb_state
                     .l1_pricing_state
                     .add_to_units_since_update(state_ref, calldata_units);
             }
             arb_state
                 .filtered_transactions
-                .is_filtered_free(tx_hash_for_filter)
+                .is_filtered(db, tx_hash_for_filter)
+                .unwrap_or(false)
         };
 
         // Reduce the gas the EVM sees by poster_gas and compute_hold_gas.
@@ -1891,7 +1906,7 @@ where
                 match action {
                     RevertedTxAction::PreRecordedRevert { gas_to_consume } => {
                         let overlay = &mut self.state_overlay;
-                        let db: &mut State<DB> = self.inner.evm_mut().db_mut();
+                        let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
                         increment_nonce(db, overlay, sender);
                         self.touched_accounts.insert(sender);
                         // RevertedTxHook fires after intrinsic deduction; the EVM never
@@ -1922,8 +1937,9 @@ where
                         return Ok(EthTxResult {
                             result: revm::context::result::ResultAndState {
                                 result: ExecutionResult::Revert {
-                                    gas_used,
+                                    gas: synthetic_result_gas(gas_used, 0),
                                     output: alloy_primitives::Bytes::new(),
+                                    logs: Vec::new(),
                                 },
                                 state: Default::default(),
                             },
@@ -1933,7 +1949,7 @@ where
                     }
                     RevertedTxAction::FilteredTx => {
                         let overlay = &mut self.state_overlay;
-                        let db: &mut State<DB> = self.inner.evm_mut().db_mut();
+                        let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
                         increment_nonce(db, overlay, sender);
                         self.touched_accounts.insert(sender);
                         // Consume all remaining gas.
@@ -1960,10 +1976,11 @@ where
                         return Ok(EthTxResult {
                             result: revm::context::result::ResultAndState {
                                 result: ExecutionResult::Revert {
-                                    gas_used,
+                                    gas: synthetic_result_gas(gas_used, 0),
                                     output: alloy_primitives::Bytes::from(
                                         "filtered transaction".as_bytes(),
                                     ),
+                                    logs: Vec::new(),
                                 },
                                 state: Default::default(),
                             },
@@ -2058,12 +2075,12 @@ where
             |this: &mut Self, units: u64| -> Result<(), BlockExecutionError> {
                 this.precompile_ctx.reset_tx();
                 let overlay = &mut this.state_overlay;
-                let db: &mut State<DB> = this.inner.evm_mut().db_mut();
+                let db = StateDbBackend::from_mut(this.inner.evm_mut().db_mut());
                 if units > 0 {
-                    let arb_state = ArbosState::open(db, SystemBurner::new(None, false))
+                    let arb_state = arbos_from_input_system(db, SystemBurner::new(None, false))
                         .map_err(BlockExecutionError::other)?;
                     // SAFETY: see `Storage::state_mut()` invariant.
-                    let state_ref = unsafe { arb_state.backing_storage.state_mut() };
+                    let state_ref = &mut *db;
                     let _ = arb_state
                         .l1_pricing_state
                         .subtract_from_units_since_update(state_ref, units);
@@ -2093,11 +2110,8 @@ where
         // Manual balance and nonce validation for user txs. ContractTx
         // (0x66) and RetryTx (0x68) skip nonce checks.
         if is_user_tx {
-            let db: &mut State<DB> = self.inner.evm_mut().db_mut();
-            let account = db
-                .load_cache_account(sender)
-                .ok()
-                .and_then(|a| a.account_info());
+            let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
+            let account = db.basic(sender).ok().flatten();
             let sender_balance = account.as_ref().map(|a| a.balance).unwrap_or(U256::ZERO);
             let sender_nonce = account.as_ref().map(|a| a.nonce).unwrap_or(0);
 
@@ -2154,11 +2168,8 @@ where
         // match the sender's current state nonce so revm increments from the
         // right value.
         if is_retry_tx || is_contract_tx {
-            let db: &mut State<DB> = self.inner.evm_mut().db_mut();
-            let sender_nonce = db
-                .load_cache_account(sender)
-                .map(|a| a.account_info().map(|i| i.nonce).unwrap_or(0))
-                .unwrap_or(0);
+            let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
+            let sender_nonce = db.basic(sender).ok().flatten().map_or(0, |info| info.nonce);
             tx_env.set_nonce(sender_nonce);
         }
 
@@ -2190,14 +2201,14 @@ where
 
         // Capture gas_used as reported by reth's EVM (before our adjustments).
         // This represents the gas cost reth already deducted from the sender.
-        let evm_gas_used = output.result.result.gas_used();
+        let evm_gas_used = output.result.result.tx_gas_used();
         // The EIP-3529 gas refund reduces the single-dimensional gas the sender
         // pays, but the per-resource multi-gas tracks the raw (pre-refund) usage
         // — the refund applies only to the single-gas pool, not the resource
         // dimensions. Carry it so the multi-gas can be reconstituted raw for the
         // v60 refund and backlog, which reconcile against pre-refund usage.
         let gas_refunded = match &output.result.result {
-            ExecutionResult::Success { gas_refunded, .. } => *gas_refunded,
+            ExecutionResult::Success { gas, .. } => gas.final_refunded(),
             _ => 0,
         };
 
@@ -2256,11 +2267,11 @@ where
                     };
                     let chain_id = self.arb_ctx.chain_id;
                     let basefee = self.arb_ctx.basefee;
-                    let db: &mut State<DB> = self.inner.evm_mut().db_mut();
-                    let arb_state = ArbosState::open(db, SystemBurner::new(None, false))
+                    let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
+                    let arb_state = arbos_from_input_system(db, SystemBurner::new(None, false))
                         .map_err(BlockExecutionError::other)?;
                     // SAFETY: see `Storage::state_mut()` invariant.
-                    let state_ref = unsafe { arb_state.backing_storage.state_mut() };
+                    let state_ref = &mut *db;
 
                     let mut encoded_retry_tx = None;
                     if let Ok(Some(retryable)) =
@@ -2386,7 +2397,7 @@ where
         // raised to the floor and the top-up is priced as L2 calldata, keeping
         // charged_multi_gas.single_gas() == gas_used (so the v60 refund stays
         // exact). The sender pays the floor via the existing sender_extra_gas.
-        let gas_before_floor = output.result.result.gas_used();
+        let gas_before_floor = output.result.result.tx_gas_used();
         if calldata_floor_gas > gas_before_floor {
             let receipt_top_up = calldata_floor_gas - gas_before_floor;
             adjust_result_gas_used(&mut output.result.result, receipt_top_up);
@@ -2422,342 +2433,292 @@ where
         Ok(output)
     }
 
-    fn commit_transaction(&mut self, output: Self::Result) -> Result<u64, BlockExecutionError> {
-        // Extract info needed for fee distribution before the output is consumed.
-        let pending = self.pending_tx.take();
-        let gas_used_total = output.result.result.gas_used();
-        let success = matches!(&output.result.result, ExecutionResult::Success { .. });
+    fn commit_transaction(&mut self, output: Self::Result) -> GasOutput {
+        let fallback = GasOutput::new(output.result.result.tx_gas_used());
+        let committed = (|| -> Result<GasOutput, BlockExecutionError> {
+            // Extract info needed for fee distribution before the output is consumed.
+            let pending = self.pending_tx.take();
+            let gas_used_total = output.result.result.tx_gas_used();
+            let success = matches!(&output.result.result, ExecutionResult::Success { .. });
 
-        // Scan receipt logs for L2→L1 withdrawal events and burn value from ArbSys.
-        // Value transferred to the ArbSys address during a withdrawEth call
-        // is burned (subtracted from ArbSys balance) after the tx commits.
-        let mut withdrawal_value = U256::ZERO;
-        if let ExecutionResult::Success { ref logs, .. } = output.result.result {
-            let arbsys_addr = arb_precompiles::ARBSYS_ADDRESS;
-            let l2_to_l1_tx_topic = keccak256(
+            // Scan receipt logs for L2→L1 withdrawal events and burn value from ArbSys.
+            // Value transferred to the ArbSys address during a withdrawEth call
+            // is burned (subtracted from ArbSys balance) after the tx commits.
+            let mut withdrawal_value = U256::ZERO;
+            if let ExecutionResult::Success { ref logs, .. } = output.result.result {
+                let arbsys_addr = arb_precompiles::ARBSYS_ADDRESS;
+                let l2_to_l1_tx_topic = keccak256(
                 b"L2ToL1Tx(address,address,uint256,uint256,uint256,uint256,uint256,uint256,bytes)",
             );
-            for log in logs {
-                if log.address == arbsys_addr
-                    && !log.data.topics().is_empty()
-                    && log.data.topics()[0] == l2_to_l1_tx_topic
-                {
-                    // L2ToL1Tx data layout: ABI-encoded [caller, arb_block, eth_block, timestamp,
-                    // callvalue, data] callvalue is at offset 4*32 = 128 bytes.
-                    if log.data.data.len() >= 160 {
-                        let callvalue = U256::from_be_slice(&log.data.data[128..160]);
-                        withdrawal_value = withdrawal_value.saturating_add(callvalue);
-                        let val_i128: i128 = callvalue.try_into().unwrap_or(i128::MAX);
-                        self.expected_balance_delta =
-                            self.expected_balance_delta.saturating_sub(val_i128);
+                for log in logs {
+                    if log.address == arbsys_addr
+                        && !log.data.topics().is_empty()
+                        && log.data.topics()[0] == l2_to_l1_tx_topic
+                    {
+                        // L2ToL1Tx data layout: ABI-encoded [caller, arb_block, eth_block, timestamp,
+                        // callvalue, data] callvalue is at offset 4*32 = 128 bytes.
+                        if log.data.data.len() >= 160 {
+                            let callvalue = U256::from_be_slice(&log.data.data[128..160]);
+                            withdrawal_value = withdrawal_value.saturating_add(callvalue);
+                            let val_i128: i128 = callvalue.try_into().unwrap_or(i128::MAX);
+                            self.expected_balance_delta =
+                                self.expected_balance_delta.saturating_sub(val_i128);
+                        }
                     }
                 }
             }
-        }
 
-        for addr in output.result.state.keys() {
-            self.touched_accounts.insert(*addr);
-        }
+            for addr in output.result.state.keys() {
+                self.touched_accounts.insert(*addr);
+            }
 
-        let gas_used = self.inner.commit_transaction(output)?;
+            let gas_output = self.inner.commit_transaction(output);
+            let gas_used = gas_output.tx_gas_used();
 
-        // An owner setter flags a per-tx state-parameter change; refresh the
-        // cached values so it takes effect within the block, including the
-        // setting transaction's own subsequent accounting.
-        if self
-            .precompile_ctx
-            .block
-            .state_params_dirty
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
-            self.refresh_state_params();
-        }
+            // An owner setter flags a per-tx state-parameter change; refresh the
+            // cached values so it takes effect within the block, including the
+            // setting transaction's own subsequent accounting.
+            if self
+                .precompile_ctx
+                .block
+                .state_params_dirty
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                self.refresh_state_params();
+            }
 
-        // Redirect the coinbase tip to network_fee_account when
-        // CollectTips is on. tx_env.gas_limit is shrunk by poster_gas before
-        // revm, so revm only minted `tip * compute_gas` to coinbase — that's
-        // the amount to transfer. tip × posterGas is burned implicitly.
-        if let Some(ref p) = pending {
-            if !p.capped_gas_price && p.coinbase_tip_per_gas > 0 && gas_used > 0 {
-                let coinbase = self.arb_ctx.coinbase;
-                let net_acct = self.arb_ctx.network_fee_account;
-                let compute_gas = gas_used.saturating_sub(p.poster_gas);
-                let tip_to_network =
-                    U256::from(p.coinbase_tip_per_gas).saturating_mul(U256::from(compute_gas));
-                if coinbase != net_acct && !tip_to_network.is_zero() {
+            // Redirect the coinbase tip to network_fee_account when
+            // CollectTips is on. tx_env.gas_limit is shrunk by poster_gas before
+            // revm, so revm only minted `tip * compute_gas` to coinbase — that's
+            // the amount to transfer. tip × posterGas is burned implicitly.
+            if let Some(ref p) = pending {
+                if !p.capped_gas_price && p.coinbase_tip_per_gas > 0 && gas_used > 0 {
+                    let coinbase = self.arb_ctx.coinbase;
+                    let net_acct = self.arb_ctx.network_fee_account;
+                    let compute_gas = gas_used.saturating_sub(p.poster_gas);
+                    let tip_to_network =
+                        U256::from(p.coinbase_tip_per_gas).saturating_mul(U256::from(compute_gas));
+                    if coinbase != net_acct && !tip_to_network.is_zero() {
+                        let overlay = &mut self.state_overlay;
+                        let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
+                        if get_balance(db, coinbase) >= tip_to_network {
+                            let _ = arb_util::transfer_balance(
+                                Some(&coinbase),
+                                Some(&net_acct),
+                                tip_to_network,
+                                |f, t, a| apply_balance_op(db, overlay, f, t, a),
+                            );
+                            self.touched_accounts.insert(coinbase);
+                            self.touched_accounts.insert(net_acct);
+                        }
+                    }
+                }
+            }
+
+            // Stylus activation data fee: sender → network (via cache, post-commit).
+            // Value was zeroed in tx_env so sender still has the ETH.
+            if let Some(ref p) = pending {
+                if !p.stylus_data_fee.is_zero() {
                     let overlay = &mut self.state_overlay;
-                    let db: &mut State<DB> = self.inner.evm_mut().db_mut();
-                    if get_balance(db, coinbase) >= tip_to_network {
-                        let _ = arb_util::transfer_balance(
-                            Some(&coinbase),
-                            Some(&net_acct),
-                            tip_to_network,
-                            |f, t, a| apply_balance_op(db, overlay, f, t, a),
-                        );
-                        self.touched_accounts.insert(coinbase);
-                        self.touched_accounts.insert(net_acct);
-                    }
-                }
-            }
-        }
-
-        // Stylus activation data fee: sender → network (via cache, post-commit).
-        // Value was zeroed in tx_env so sender still has the ETH.
-        if let Some(ref p) = pending {
-            if !p.stylus_data_fee.is_zero() {
-                let overlay = &mut self.state_overlay;
-                let db: &mut State<DB> = self.inner.evm_mut().db_mut();
-                let _ = arb_util::burn_balance(&p.sender, p.stylus_data_fee, |f, t, a| {
-                    apply_balance_op(db, overlay, f, t, a)
-                });
-                let _ = arb_util::mint_balance(
-                    &self.arb_ctx.network_fee_account,
-                    p.stylus_data_fee,
-                    |f, t, a| apply_balance_op(db, overlay, f, t, a),
-                );
-                self.touched_accounts.insert(p.sender);
-                self.touched_accounts
-                    .insert(self.arb_ctx.network_fee_account);
-            }
-        }
-
-        // Cancelled-retryable escrow sweep: move the ticket's escrow balance to
-        // its beneficiary in the same block, through the cache and overlay so it
-        // forms a single state transition.
-        if let Some((escrow, beneficiary)) = self.precompile_ctx.take_cancel_escrow_sweep() {
-            let arbos_ver = self.arb_ctx.arbos_version;
-            let touched_ptr = &mut self.touched_accounts as *mut rustc_hash::FxHashSet<Address>;
-            let zombie_ptr = &mut self.zombie_accounts as *mut rustc_hash::FxHashSet<Address>;
-            let finalise_ptr = &self.finalise_deleted as *const rustc_hash::FxHashSet<Address>;
-            let overlay_ptr = &mut self.state_overlay as *mut StateOverlay;
-            let db: &mut State<DB> = self.inner.evm_mut().db_mut();
-            let amount = get_balance(db, escrow);
-
-            // SAFETY: see `Storage::state_mut()` invariant. The pointers reborrow
-            // disjoint fields of `self` (`touched_accounts`, `zombie_accounts`,
-            // `finalise_deleted`, `state_overlay`); `db` borrows `self.inner`. No
-            // two of these alias within this block.
-            unsafe {
-                if amount.is_zero()
-                    && arbos_ver < arb_chainspec::arbos_version::ARBOS_VERSION_STYLUS
-                {
-                    create_zombie_if_deleted(
-                        db,
-                        &mut *overlay_ptr,
-                        escrow,
-                        &*finalise_ptr,
-                        &mut *zombie_ptr,
-                        &mut *touched_ptr,
+                    let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
+                    let _ = arb_util::burn_balance(&p.sender, p.stylus_data_fee, |f, t, a| {
+                        apply_balance_op(db, overlay, f, t, a)
+                    });
+                    let _ = arb_util::mint_balance(
+                        &self.arb_ctx.network_fee_account,
+                        p.stylus_data_fee,
+                        |f, t, a| apply_balance_op(db, overlay, f, t, a),
                     );
+                    self.touched_accounts.insert(p.sender);
+                    self.touched_accounts
+                        .insert(self.arb_ctx.network_fee_account);
                 }
-                let _ = apply_balance_op(
-                    db,
-                    &mut *overlay_ptr,
-                    Some(&escrow),
-                    Some(&beneficiary),
-                    amount,
-                );
-                if !amount.is_zero() {
-                    (*zombie_ptr).remove(&escrow);
-                }
-                (*zombie_ptr).remove(&beneficiary);
-                (*touched_ptr).insert(escrow);
-                (*touched_ptr).insert(beneficiary);
-            }
-        }
-
-        // Burn ETH from ArbSys address for L2→L1 withdrawals.
-        if !withdrawal_value.is_zero() {
-            let overlay = &mut self.state_overlay;
-            let db: &mut State<DB> = self.inner.evm_mut().db_mut();
-            let _ = arb_util::burn_balance(
-                &arb_precompiles::ARBSYS_ADDRESS,
-                withdrawal_value,
-                |f, t, a| apply_balance_op(db, overlay, f, t, a),
-            );
-            self.touched_accounts
-                .insert(arb_precompiles::ARBSYS_ADDRESS);
-        }
-
-        // Track poster gas and multi-gas for this receipt (parallel to receipts vector).
-        let poster_gas_for_receipt = pending.as_ref().map_or(0, |p| p.poster_gas);
-        self.gas_used_for_l1.push(poster_gas_for_receipt);
-        let multi_gas_for_receipt = pending
-            .as_ref()
-            .map_or(MultiGas::zero(), |p| p.charged_multi_gas);
-        self.multi_gas_used.push(multi_gas_for_receipt);
-
-        // --- Post-execution: fee distribution ---
-        if let Some(pending) = pending {
-            let is_retry = pending.retry_context.is_some();
-
-            // Safety check: gas refund should never exceed gas limit.
-            debug_assert!(
-                gas_used_total <= pending.tx_gas_limit,
-                "gas_used ({gas_used_total}) exceeds gas_limit ({})",
-                pending.tx_gas_limit
-            );
-
-            // Charge the sender for gas reth's buyGas didn't cover: poster_gas
-            // on normal txs, full gas_used on early-return paths. Priced at
-            // actual_gas_price so `tip * posterGas` gets burned here (revm
-            // never minted it to coinbase, since we shrunk gas_limit first).
-            let sender_extra_gas = gas_used_total.saturating_sub(pending.evm_gas_used);
-            if sender_extra_gas > 0 {
-                let extra_cost = pending
-                    .actual_gas_price
-                    .saturating_mul(U256::from(sender_extra_gas));
-                let overlay = &mut self.state_overlay;
-                let db: &mut State<DB> = self.inner.evm_mut().db_mut();
-                let _ = arb_util::burn_balance(&pending.sender, extra_cost, |f, t, a| {
-                    apply_balance_op(db, overlay, f, t, a)
-                });
-                self.touched_accounts.insert(pending.sender);
             }
 
-            if let Some(retry_ctx) = pending.retry_context {
-                // RetryTx end-of-tx: handle gas refunds, retryable cleanup.
-                let gas_left = pending.tx_gas_limit.saturating_sub(gas_used_total);
-
-                let db: &mut State<DB> = self.inner.evm_mut().db_mut();
+            // Cancelled-retryable escrow sweep: move the ticket's escrow balance to
+            // its beneficiary in the same block, through the cache and overlay so it
+            // forms a single state transition.
+            if let Some((escrow, beneficiary)) = self.precompile_ctx.take_cancel_escrow_sweep() {
+                let arbos_ver = self.arb_ctx.arbos_version;
                 let touched_ptr = &mut self.touched_accounts as *mut rustc_hash::FxHashSet<Address>;
                 let zombie_ptr = &mut self.zombie_accounts as *mut rustc_hash::FxHashSet<Address>;
                 let finalise_ptr = &self.finalise_deleted as *const rustc_hash::FxHashSet<Address>;
                 let overlay_ptr = &mut self.state_overlay as *mut StateOverlay;
-                let arbos_ver = self.arb_ctx.arbos_version;
+                let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
+                let amount = get_balance(db, escrow);
 
-                let arb_state_retry = ArbosState::open(db, SystemBurner::new(None, false))
-                    .map_err(BlockExecutionError::other)?;
-                // SAFETY: see `Storage::state_mut()` invariant. The cloned
-                // storage handles below let the closures re-materialise the
-                // state borrow on demand without holding a long-lived `&mut`.
-                let burn_storage = arb_state_retry.backing_storage.clone();
-                let transfer_storage = arb_state_retry.backing_storage.clone();
-                let delete_transfer_storage = arb_state_retry.backing_storage.clone();
-                let delete_balance_storage = arb_state_retry.backing_storage.clone();
-                let escrow_storage = arb_state_retry.backing_storage.clone();
+                // SAFETY: see `Storage::state_mut()` invariant. The pointers reborrow
+                // disjoint fields of `self` (`touched_accounts`, `zombie_accounts`,
+                // `finalise_deleted`, `state_overlay`); `db` borrows `self.inner`. No
+                // two of these alias within this block.
+                unsafe {
+                    if amount.is_zero()
+                        && arbos_ver < arb_chainspec::arbos_version::ARBOS_VERSION_STYLUS
+                    {
+                        create_zombie_if_deleted(
+                            db,
+                            &mut *overlay_ptr,
+                            escrow,
+                            &*finalise_ptr,
+                            &mut *zombie_ptr,
+                            &mut *touched_ptr,
+                        );
+                    }
+                    let _ = apply_balance_op(
+                        db,
+                        &mut *overlay_ptr,
+                        Some(&escrow),
+                        Some(&beneficiary),
+                        amount,
+                    );
+                    if !amount.is_zero() {
+                        (*zombie_ptr).remove(&escrow);
+                    }
+                    (*zombie_ptr).remove(&beneficiary);
+                    (*touched_ptr).insert(escrow);
+                    (*touched_ptr).insert(beneficiary);
+                }
+            }
 
-                // ArbOS 60 evaluated multi-gas refunds unconditionally. At
-                // v61+ Nitro only does so when multi-gas constraints are the
-                // active pricing model.
-                let should_compute_multi_gas_refund = {
-                    // SAFETY: see `Storage::state_mut()` invariant.
-                    let state_ref = unsafe { arb_state_retry.backing_storage.state_mut() };
-                    arb_state_retry
-                        .l2_pricing_state
-                        .should_compute_multi_gas_refund(state_ref)
-                        .unwrap_or(false)
-                };
-                let multi_dimensional_cost = if should_compute_multi_gas_refund {
-                    let cached = self.multi_gas_current_fees.get_or_init(|| {
+            // Burn ETH from ArbSys address for L2→L1 withdrawals.
+            if !withdrawal_value.is_zero() {
+                let overlay = &mut self.state_overlay;
+                let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
+                let _ = arb_util::burn_balance(
+                    &arb_precompiles::ARBSYS_ADDRESS,
+                    withdrawal_value,
+                    |f, t, a| apply_balance_op(db, overlay, f, t, a),
+                );
+                self.touched_accounts
+                    .insert(arb_precompiles::ARBSYS_ADDRESS);
+            }
+
+            // Track poster gas and multi-gas for this receipt (parallel to receipts vector).
+            let poster_gas_for_receipt = pending.as_ref().map_or(0, |p| p.poster_gas);
+            self.gas_used_for_l1.push(poster_gas_for_receipt);
+            let multi_gas_for_receipt = pending
+                .as_ref()
+                .map_or(MultiGas::zero(), |p| p.charged_multi_gas);
+            self.multi_gas_used.push(multi_gas_for_receipt);
+
+            // --- Post-execution: fee distribution ---
+            if let Some(pending) = pending {
+                let is_retry = pending.retry_context.is_some();
+
+                // Safety check: gas refund should never exceed gas limit.
+                debug_assert!(
+                    gas_used_total <= pending.tx_gas_limit,
+                    "gas_used ({gas_used_total}) exceeds gas_limit ({})",
+                    pending.tx_gas_limit
+                );
+
+                // Charge the sender for gas reth's buyGas didn't cover: poster_gas
+                // on normal txs, full gas_used on early-return paths. Priced at
+                // actual_gas_price so `tip * posterGas` gets burned here (revm
+                // never minted it to coinbase, since we shrunk gas_limit first).
+                let sender_extra_gas = gas_used_total.saturating_sub(pending.evm_gas_used);
+                if sender_extra_gas > 0 {
+                    let extra_cost = pending
+                        .actual_gas_price
+                        .saturating_mul(U256::from(sender_extra_gas));
+                    let overlay = &mut self.state_overlay;
+                    let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
+                    let _ = arb_util::burn_balance(&pending.sender, extra_cost, |f, t, a| {
+                        apply_balance_op(db, overlay, f, t, a)
+                    });
+                    self.touched_accounts.insert(pending.sender);
+                }
+
+                if let Some(retry_ctx) = pending.retry_context {
+                    // RetryTx end-of-tx: handle gas refunds, retryable cleanup.
+                    let gas_left = pending.tx_gas_limit.saturating_sub(gas_used_total);
+
+                    let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
+                    let touched_ptr =
+                        &mut self.touched_accounts as *mut rustc_hash::FxHashSet<Address>;
+                    let zombie_ptr =
+                        &mut self.zombie_accounts as *mut rustc_hash::FxHashSet<Address>;
+                    let finalise_ptr =
+                        &self.finalise_deleted as *const rustc_hash::FxHashSet<Address>;
+                    let overlay_ptr = &mut self.state_overlay as *mut StateOverlay;
+                    let arbos_ver = self.arb_ctx.arbos_version;
+
+                    let arb_state_retry =
+                        arbos_from_input_system(db, SystemBurner::new(None, false))
+                            .map_err(BlockExecutionError::other)?;
+                    let db_ptr: *mut StateDbBackend<DB> = db;
+
+                    // ArbOS 60 evaluated multi-gas refunds unconditionally. At
+                    // v61+ Nitro only does so when multi-gas constraints are the
+                    // active pricing model.
+                    let should_compute_multi_gas_refund = {
                         // SAFETY: see `Storage::state_mut()` invariant.
-                        let state_ref = unsafe { arb_state_retry.backing_storage.state_mut() };
+                        let state_ref = &mut *db;
                         arb_state_retry
                             .l2_pricing_state
-                            .get_current_multi_gas_fees(state_ref)
-                            .unwrap_or([U256::ZERO; NUM_RESOURCE_KIND])
-                    });
-                    // SAFETY: see `Storage::state_mut()` invariant.
-                    let state_ref = unsafe { arb_state_retry.backing_storage.state_mut() };
-                    arb_state_retry
-                        .l2_pricing_state
-                        .multi_dimensional_price_for_refund_with_fees(
-                            state_ref,
-                            pending.charged_multi_gas,
-                            cached,
-                            self.arb_ctx.basefee,
-                        )
-                        .ok()
-                } else {
-                    None
-                };
-
-                let result = self.arb_hooks.as_ref().map(|hooks| {
-                    hooks.tx_proc.end_tx_retryable(
-                        &EndTxRetryableParams {
-                            gas_left,
-                            gas_used: gas_used_total,
-                            effective_base_fee: self.arb_ctx.basefee,
-                            from: pending.sender,
-                            refund_to: retry_ctx.refund_to,
-                            max_refund: retry_ctx.max_refund,
-                            submission_fee_refund: retry_ctx.submission_fee_refund,
-                            ticket_id: retry_ctx.ticket_id,
-                            value: U256::ZERO, // Already transferred in pre-exec
-                            success,
-                            network_fee_account: self.arb_ctx.network_fee_account,
-                            infra_fee_account: self.arb_ctx.infra_fee_account,
-                            min_base_fee: self.arb_ctx.min_base_fee,
-                            arbos_version: self.arb_ctx.arbos_version,
-                            multi_dimensional_cost,
-                            block_base_fee: self.arb_ctx.basefee,
-                        },
-                        |addr, amount| {
+                            .should_compute_multi_gas_refund(state_ref)
+                            .unwrap_or(false)
+                    };
+                    let multi_dimensional_cost = if should_compute_multi_gas_refund {
+                        let cached = self.multi_gas_current_fees.get_or_init(|| {
                             // SAFETY: see `Storage::state_mut()` invariant.
-                            unsafe {
-                                apply_burn_to_state(
-                                    burn_storage.state_mut(),
-                                    &mut *overlay_ptr,
-                                    addr,
-                                    amount,
-                                );
-                                (*touched_ptr).insert(addr);
-                            }
-                        },
-                        |from, to, amount| {
-                            // SAFETY: see `Storage::state_mut()` invariant.
-                            unsafe {
-                                let state = transfer_storage.state_mut();
-                                if amount.is_zero()
-                                    && arbos_ver
-                                        < arb_chainspec::arbos_version::ARBOS_VERSION_STYLUS
-                                {
-                                    create_zombie_if_deleted(
-                                        state,
-                                        &mut *overlay_ptr,
-                                        from,
-                                        &*finalise_ptr,
-                                        &mut *zombie_ptr,
-                                        &mut *touched_ptr,
-                                    );
-                                }
-                                // end_tx_retryable distributes refunds via refund_with_pool,
-                                // which already discards typed errors. Mirror that pattern
-                                // here so a hypothetical shortfall does not surface as Err
-                                // and short-circuit downstream bookkeeping.
-                                let _ = apply_balance_op(
-                                    state,
-                                    &mut *overlay_ptr,
-                                    Some(&from),
-                                    Some(&to),
-                                    amount,
-                                );
-                                // Go's SubBalance(from, nonzero) creates a non-zombie
-                                // balanceChange entry, breaking zombie protection.
-                                if !amount.is_zero() {
-                                    (*zombie_ptr).remove(&from);
-                                }
-                                // Go's AddBalance(to, _) dirts `to`, breaking zombie.
-                                (*zombie_ptr).remove(&to);
-                                (*touched_ptr).insert(from);
-                                (*touched_ptr).insert(to);
-                            }
-                            Ok(())
-                        },
-                    )
-                });
-
-                if let Some(ref result) = result {
-                    if result.should_delete_retryable {
+                            let state_ref = &mut *db;
+                            arb_state_retry
+                                .l2_pricing_state
+                                .get_current_multi_gas_fees(state_ref)
+                                .unwrap_or([U256::ZERO; NUM_RESOURCE_KIND])
+                        });
                         // SAFETY: see `Storage::state_mut()` invariant.
-                        let state_ref = unsafe { arb_state_retry.backing_storage.state_mut() };
-                        let _ = arb_state_retry.retryable_state.delete_retryable(
-                            state_ref,
-                            retry_ctx.ticket_id,
-                            |from, to, amount| {
-                                // SAFETY: see `Storage::state_mut()` invariant.
+                        let state_ref = &mut *db;
+                        arb_state_retry
+                            .l2_pricing_state
+                            .multi_dimensional_price_for_refund_with_fees(
+                                state_ref,
+                                pending.charged_multi_gas,
+                                cached,
+                                self.arb_ctx.basefee,
+                            )
+                            .ok()
+                    } else {
+                        None
+                    };
+
+                    let result = self.arb_hooks.as_ref().map(|hooks| {
+                        hooks.tx_proc.end_tx_retryable(
+                            &EndTxRetryableParams {
+                                gas_left,
+                                gas_used: gas_used_total,
+                                effective_base_fee: self.arb_ctx.basefee,
+                                from: pending.sender,
+                                refund_to: retry_ctx.refund_to,
+                                max_refund: retry_ctx.max_refund,
+                                submission_fee_refund: retry_ctx.submission_fee_refund,
+                                ticket_id: retry_ctx.ticket_id,
+                                value: U256::ZERO, // Already transferred in pre-exec
+                                success,
+                                network_fee_account: self.arb_ctx.network_fee_account,
+                                infra_fee_account: self.arb_ctx.infra_fee_account,
+                                min_base_fee: self.arb_ctx.min_base_fee,
+                                arbos_version: self.arb_ctx.arbos_version,
+                                multi_dimensional_cost,
+                                block_base_fee: self.arb_ctx.basefee,
+                            },
+                            |addr, amount| {
+                                // SAFETY: ArbOS invokes these callbacks synchronously.
                                 unsafe {
-                                    let state = delete_transfer_storage.state_mut();
+                                    apply_burn_to_state(
+                                        &mut *db_ptr,
+                                        &mut *overlay_ptr,
+                                        addr,
+                                        amount,
+                                    );
+                                    (*touched_ptr).insert(addr);
+                                }
+                            },
+                            |from, to, amount| {
+                                // SAFETY: ArbOS invokes these callbacks synchronously.
+                                unsafe {
+                                    let state = &mut *db_ptr;
                                     if amount.is_zero()
                                         && arbos_ver
                                             < arb_chainspec::arbos_version::ARBOS_VERSION_STYLUS
@@ -2771,12 +2732,10 @@ where
                                             &mut *touched_ptr,
                                         );
                                     }
-                                    // delete_retryable propagates this closure's error
-                                    // via `?` and would skip clearing ticket fields on
-                                    // shortfall. The escrow holds the retryable's full
-                                    // callvalue by construction, so this never errors in
-                                    // practice; swallow the typed error to preserve the
-                                    // historic "always-clear" behavior.
+                                    // end_tx_retryable distributes refunds via refund_with_pool,
+                                    // which already discards typed errors. Mirror that pattern
+                                    // here so a hypothetical shortfall does not surface as Err
+                                    // and short-circuit downstream bookkeeping.
                                     let _ = apply_balance_op(
                                         state,
                                         &mut *overlay_ptr,
@@ -2784,330 +2743,358 @@ where
                                         Some(&to),
                                         amount,
                                     );
+                                    // Go's SubBalance(from, nonzero) creates a non-zombie
+                                    // balanceChange entry, breaking zombie protection.
                                     if !amount.is_zero() {
                                         (*zombie_ptr).remove(&from);
                                     }
+                                    // Go's AddBalance(to, _) dirts `to`, breaking zombie.
                                     (*zombie_ptr).remove(&to);
                                     (*touched_ptr).insert(from);
                                     (*touched_ptr).insert(to);
                                 }
                                 Ok(())
                             },
-                            |addr| {
-                                // SAFETY: see `Storage::state_mut()` invariant.
-                                unsafe { get_balance(delete_balance_storage.state_mut(), addr) }
-                            },
-                        );
-                    } else if result.should_return_value_to_escrow {
-                        // Failed retry: return call value to escrow.
-                        // SAFETY: see `Storage::state_mut()` invariant.
-                        unsafe {
-                            let state = escrow_storage.state_mut();
-                            if retry_ctx.call_value.is_zero()
-                                && arbos_ver < arb_chainspec::arbos_version::ARBOS_VERSION_STYLUS
-                            {
-                                create_zombie_if_deleted(
-                                    state,
-                                    &mut *overlay_ptr,
-                                    pending.sender,
-                                    &*finalise_ptr,
-                                    &mut *zombie_ptr,
-                                    &mut *touched_ptr,
-                                );
-                            }
-                            let _ = arb_util::transfer_balance(
-                                Some(&pending.sender),
-                                Some(&result.escrow_address),
-                                retry_ctx.call_value,
-                                |f, t, a| {
-                                    apply_balance_op(
-                                        escrow_storage.state_mut(),
-                                        &mut *overlay_ptr,
-                                        f,
-                                        t,
-                                        a,
-                                    )
+                        )
+                    });
+
+                    if let Some(ref result) = result {
+                        if result.should_delete_retryable {
+                            // SAFETY: see `Storage::state_mut()` invariant.
+                            let state_ref = &mut *db;
+                            let _ = arb_state_retry.retryable_state.delete_retryable(
+                                state_ref,
+                                retry_ctx.ticket_id,
+                                |from, to, amount| {
+                                    // SAFETY: ArbOS invokes these callbacks synchronously.
+                                    unsafe {
+                                        let state = &mut *db_ptr;
+                                        if amount.is_zero()
+                                            && arbos_ver
+                                                < arb_chainspec::arbos_version::ARBOS_VERSION_STYLUS
+                                        {
+                                            create_zombie_if_deleted(
+                                                state,
+                                                &mut *overlay_ptr,
+                                                from,
+                                                &*finalise_ptr,
+                                                &mut *zombie_ptr,
+                                                &mut *touched_ptr,
+                                            );
+                                        }
+                                        // delete_retryable propagates this closure's error
+                                        // via `?` and would skip clearing ticket fields on
+                                        // shortfall. The escrow holds the retryable's full
+                                        // callvalue by construction, so this never errors in
+                                        // practice; swallow the typed error to preserve the
+                                        // historic "always-clear" behavior.
+                                        let _ = apply_balance_op(
+                                            state,
+                                            &mut *overlay_ptr,
+                                            Some(&from),
+                                            Some(&to),
+                                            amount,
+                                        );
+                                        if !amount.is_zero() {
+                                            (*zombie_ptr).remove(&from);
+                                        }
+                                        (*zombie_ptr).remove(&to);
+                                        (*touched_ptr).insert(from);
+                                        (*touched_ptr).insert(to);
+                                    }
+                                    Ok(())
                                 },
+                                |addr| unsafe { get_balance(&mut *db_ptr, addr) },
                             );
-                            // Go's SubBalance(sender, nonzero) breaks zombie on sender.
-                            if !retry_ctx.call_value.is_zero() {
-                                (*zombie_ptr).remove(&pending.sender);
+                        } else if result.should_return_value_to_escrow {
+                            // Failed retry: return call value to escrow.
+                            // SAFETY: ArbOS invokes these callbacks synchronously.
+                            unsafe {
+                                let state = &mut *db_ptr;
+                                if retry_ctx.call_value.is_zero()
+                                    && arbos_ver
+                                        < arb_chainspec::arbos_version::ARBOS_VERSION_STYLUS
+                                {
+                                    create_zombie_if_deleted(
+                                        state,
+                                        &mut *overlay_ptr,
+                                        pending.sender,
+                                        &*finalise_ptr,
+                                        &mut *zombie_ptr,
+                                        &mut *touched_ptr,
+                                    );
+                                }
+                                let _ = arb_util::transfer_balance(
+                                    Some(&pending.sender),
+                                    Some(&result.escrow_address),
+                                    retry_ctx.call_value,
+                                    |f, t, a| {
+                                        apply_balance_op(&mut *db_ptr, &mut *overlay_ptr, f, t, a)
+                                    },
+                                );
+                                // Go's SubBalance(sender, nonzero) breaks zombie on sender.
+                                if !retry_ctx.call_value.is_zero() {
+                                    (*zombie_ptr).remove(&pending.sender);
+                                }
+                                // Go's AddBalance(escrow, _) breaks zombie on escrow.
+                                (*zombie_ptr).remove(&result.escrow_address);
+                                (*touched_ptr).insert(pending.sender);
+                                (*touched_ptr).insert(result.escrow_address);
                             }
-                            // Go's AddBalance(escrow, _) breaks zombie on escrow.
-                            (*zombie_ptr).remove(&result.escrow_address);
-                            (*touched_ptr).insert(pending.sender);
-                            (*touched_ptr).insert(result.escrow_address);
+                        }
+
+                        // SAFETY: see `Storage::state_mut()` invariant.
+                        let state_ref = &mut *db;
+                        let _ = arb_state_retry.l2_pricing_state.grow_backlog(
+                            state_ref,
+                            result.compute_gas_for_backlog,
+                            pending.charged_multi_gas,
+                        );
+                        if let Ok(b) = arb_state_retry.l2_pricing_state.gas_backlog(state_ref) {
+                            self.precompile_ctx.block.set_current_gas_backlog(b);
                         }
                     }
+                } else if matches!(
+                    pending.arb_tx_type,
+                    None | Some(ArbTxType::ArbitrumLegacyTx)
+                        | Some(ArbTxType::ArbitrumUnsignedTx)
+                        | Some(ArbTxType::ArbitrumContractTx)
+                ) {
+                    // Normal tx fee distribution: standard EOA-signed txs, plus
+                    // UnsignedTx/ContractTx (L1->L2 messages that pass through normal
+                    // EVM gas charging). Poster cost is zero for the latter two.
+                    let gas_left = pending.tx_gas_limit.saturating_sub(gas_used_total);
 
-                    // SAFETY: see `Storage::state_mut()` invariant.
-                    let state_ref = unsafe { arb_state_retry.backing_storage.state_mut() };
-                    let _ = arb_state_retry.l2_pricing_state.grow_backlog(
-                        state_ref,
-                        result.compute_gas_for_backlog,
-                        pending.charged_multi_gas,
-                    );
-                    if let Ok(b) = arb_state_retry.l2_pricing_state.gas_backlog(state_ref) {
-                        self.precompile_ctx.block.set_current_gas_backlog(b);
-                    }
-                }
-            } else if matches!(
-                pending.arb_tx_type,
-                None | Some(ArbTxType::ArbitrumLegacyTx)
-                    | Some(ArbTxType::ArbitrumUnsignedTx)
-                    | Some(ArbTxType::ArbitrumContractTx)
-            ) {
-                // Normal tx fee distribution: standard EOA-signed txs, plus
-                // UnsignedTx/ContractTx (L1->L2 messages that pass through normal
-                // EVM gas charging). Poster cost is zero for the latter two.
-                let gas_left = pending.tx_gas_limit.saturating_sub(gas_used_total);
+                    let fee_dist = self.arb_hooks.as_ref().map(|hooks| {
+                        hooks.compute_end_tx_fees(&EndTxContext {
+                            sender: pending.sender,
+                            gas_left,
+                            gas_used: gas_used_total,
+                            gas_price: self.arb_ctx.basefee,
+                            base_fee: self.arb_ctx.basefee,
+                            tx_type: pending.arb_tx_type.unwrap_or(ArbTxType::ArbitrumLegacyTx),
+                            success,
+                            refund_to: pending.sender,
+                        })
+                    });
 
-                let fee_dist = self.arb_hooks.as_ref().map(|hooks| {
-                    hooks.compute_end_tx_fees(&EndTxContext {
-                        sender: pending.sender,
-                        gas_left,
-                        gas_used: gas_used_total,
-                        gas_price: self.arb_ctx.basefee,
-                        base_fee: self.arb_ctx.basefee,
-                        tx_type: pending.arb_tx_type.unwrap_or(ArbTxType::ArbitrumLegacyTx),
-                        success,
-                        refund_to: pending.sender,
-                    })
-                });
+                    if let Some(ref dist) = fee_dist {
+                        {
+                            let overlay = &mut self.state_overlay;
+                            let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
+                            apply_fee_distribution(db, overlay, dist, None);
+                        }
+                        // Skip the network-fee touch when compute cost is 0
+                        // (avoids a no-op EIP-161 touch).
+                        if !dist.network_fee_amount.is_zero() {
+                            self.touched_accounts.insert(dist.network_fee_account);
+                        }
+                        self.touched_accounts.insert(dist.infra_fee_account);
+                        self.touched_accounts.insert(dist.poster_fee_destination);
 
-                if let Some(ref dist) = fee_dist {
-                    {
-                        let overlay = &mut self.state_overlay;
-                        let db: &mut State<DB> = self.inner.evm_mut().db_mut();
-                        apply_fee_distribution(db, overlay, dist, None);
-                    }
-                    // Skip the network-fee touch when compute cost is 0
-                    // (avoids a no-op EIP-161 touch).
-                    if !dist.network_fee_amount.is_zero() {
-                        self.touched_accounts.insert(dist.network_fee_account);
-                    }
-                    self.touched_accounts.insert(dist.infra_fee_account);
-                    self.touched_accounts.insert(dist.poster_fee_destination);
+                        let basefee_active = self.arb_ctx.basefee;
+                        let charged_multi_gas = pending.charged_multi_gas;
+                        let poster_gas_active = pending.poster_gas;
+                        let gas_price_positive_active = pending.gas_price_positive;
 
-                    let basefee_active = self.arb_ctx.basefee;
-                    let charged_multi_gas = pending.charged_multi_gas;
-                    let poster_gas_active = pending.poster_gas;
-                    let gas_price_positive_active = pending.gas_price_positive;
+                        let (refund_done, new_backlog) = {
+                            let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
+                            let arb_state_post =
+                                arbos_from_input_system(db, SystemBurner::new(None, false))
+                                    .map_err(BlockExecutionError::other)?;
+                            let db_ptr: *mut StateDbBackend<DB> = db;
+                            let overlay_ptr = &mut self.state_overlay as *mut StateOverlay;
 
-                    let (refund_done, new_backlog) = {
-                        let db: &mut State<DB> = self.inner.evm_mut().db_mut();
-                        let arb_state_post = ArbosState::open(db, SystemBurner::new(None, false))
-                            .map_err(BlockExecutionError::other)?;
-                        // SAFETY: see `Storage::state_mut()` invariant. Cloned
-                        // so the inner `transfer_balance` closure can
-                        // re-materialise the state borrow alongside the outer
-                        // accessor calls.
-                        let refund_storage = arb_state_post.backing_storage.clone();
-                        let overlay_ptr = &mut self.state_overlay as *mut StateOverlay;
-
-                        let mut refund_done = false;
-                        let should_compute_multi_gas_refund = {
-                            // SAFETY: see `Storage::state_mut()` invariant.
-                            let state_ref = unsafe { arb_state_post.backing_storage.state_mut() };
-                            arb_state_post
-                                .l2_pricing_state
-                                .should_compute_multi_gas_refund(state_ref)
-                                .unwrap_or(false)
-                        };
-                        if should_compute_multi_gas_refund {
-                            let total_cost =
-                                basefee_active.saturating_mul(U256::from(gas_used_total));
-                            let cached = self.multi_gas_current_fees.get_or_init(|| {
+                            let mut refund_done = false;
+                            let should_compute_multi_gas_refund = {
                                 // SAFETY: see `Storage::state_mut()` invariant.
-                                let state_ref =
-                                    unsafe { arb_state_post.backing_storage.state_mut() };
+                                let state_ref = &mut *db;
                                 arb_state_post
                                     .l2_pricing_state
-                                    .get_current_multi_gas_fees(state_ref)
-                                    .unwrap_or([U256::ZERO; NUM_RESOURCE_KIND])
-                            });
-                            // SAFETY: see `Storage::state_mut()` invariant.
-                            let state_ref = unsafe { arb_state_post.backing_storage.state_mut() };
-                            let multi_cost = arb_state_post
-                                .l2_pricing_state
-                                .multi_dimensional_price_for_refund_with_fees(
-                                    state_ref,
-                                    charged_multi_gas,
-                                    cached,
-                                    basefee_active,
-                                )
-                                .unwrap_or(total_cost);
-                            if total_cost > multi_cost {
-                                let refund_amount = total_cost.saturating_sub(multi_cost);
-                                let _ = arb_util::transfer_balance(
-                                    Some(&dist.network_fee_account),
-                                    Some(&pending.sender),
-                                    refund_amount,
-                                    |f, t, a| {
-                                        // SAFETY: see `Storage::state_mut()` invariant.
-                                        unsafe {
+                                    .should_compute_multi_gas_refund(state_ref)
+                                    .unwrap_or(false)
+                            };
+                            if should_compute_multi_gas_refund {
+                                let total_cost =
+                                    basefee_active.saturating_mul(U256::from(gas_used_total));
+                                let cached = self.multi_gas_current_fees.get_or_init(|| {
+                                    // SAFETY: the OnceLock initializer runs
+                                    // synchronously while `db` remains alive.
+                                    let state_ref = unsafe { &mut *db_ptr };
+                                    arb_state_post
+                                        .l2_pricing_state
+                                        .get_current_multi_gas_fees(state_ref)
+                                        .unwrap_or([U256::ZERO; NUM_RESOURCE_KIND])
+                                });
+                                // SAFETY: see `Storage::state_mut()` invariant.
+                                let state_ref = &mut *db;
+                                let multi_cost = arb_state_post
+                                    .l2_pricing_state
+                                    .multi_dimensional_price_for_refund_with_fees(
+                                        state_ref,
+                                        charged_multi_gas,
+                                        cached,
+                                        basefee_active,
+                                    )
+                                    .unwrap_or(total_cost);
+                                if total_cost > multi_cost {
+                                    let refund_amount = total_cost.saturating_sub(multi_cost);
+                                    let _ = arb_util::transfer_balance(
+                                        Some(&dist.network_fee_account),
+                                        Some(&pending.sender),
+                                        refund_amount,
+                                        |f, t, a| unsafe {
                                             apply_balance_op(
-                                                refund_storage.state_mut(),
+                                                &mut *db_ptr,
                                                 &mut *overlay_ptr,
                                                 f,
                                                 t,
                                                 a,
                                             )
-                                        }
-                                    },
+                                        },
+                                    );
+                                    refund_done = true;
+                                }
+                            }
+
+                            // Remove poster gas from the L1Calldata dimension: the
+                            // poster gas was added during gas charging, but for
+                            // backlog growth we only want compute gas in the
+                            // multi-gas.
+                            let used_multi_gas = charged_multi_gas
+                                .saturating_sub(MultiGas::single_dim_gas(poster_gas_active));
+
+                            let mut new_backlog: Option<u64> = None;
+                            if gas_price_positive_active {
+                                // SAFETY: see `Storage::state_mut()` invariant.
+                                let state_ref = &mut *db;
+                                let _ = arb_state_post.l2_pricing_state.grow_backlog(
+                                    state_ref,
+                                    dist.compute_gas_for_backlog,
+                                    used_multi_gas,
                                 );
-                                refund_done = true;
+                                new_backlog =
+                                    arb_state_post.l2_pricing_state.gas_backlog(state_ref).ok();
+                            }
+                            if !dist.l1_fees_to_add.is_zero() {
+                                // SAFETY: see `Storage::state_mut()` invariant.
+                                let state_ref = &mut *db;
+                                let _ = arb_state_post
+                                    .l1_pricing_state
+                                    .add_to_l1_fees_available(state_ref, dist.l1_fees_to_add);
+                            }
+
+                            (refund_done, new_backlog)
+                        };
+
+                        if refund_done {
+                            self.touched_accounts.insert(dist.network_fee_account);
+                            self.touched_accounts.insert(pending.sender);
+                        }
+                        if let Some(b) = new_backlog {
+                            self.precompile_ctx.block.set_current_gas_backlog(b);
+                        }
+                    }
+                }
+
+                // FixRedeemGas (ArbOS >= 11): subtract gas allocated to scheduled
+                // retry txs from this tx's gas_used for block rate limiting, since
+                // that gas will be accounted for when the retry tx itself executes.
+                let mut adjusted_gas_used = gas_used_total;
+                if self.arb_ctx.arbos_version
+                    >= arb_chainspec::arbos_version::ARBOS_VERSION_FIX_REDEEM_GAS
+                {
+                    if let Some(hooks) = self.arb_hooks.as_ref() {
+                        for scheduled in &hooks.tx_proc.scheduled_txs {
+                            if let Some(retry_gas) = decode_retry_tx_gas(scheduled) {
+                                adjusted_gas_used = adjusted_gas_used.saturating_sub(retry_gas);
                             }
                         }
-
-                        // Remove poster gas from the L1Calldata dimension: the
-                        // poster gas was added during gas charging, but for
-                        // backlog growth we only want compute gas in the
-                        // multi-gas.
-                        let used_multi_gas = charged_multi_gas
-                            .saturating_sub(MultiGas::single_dim_gas(poster_gas_active));
-
-                        let mut new_backlog: Option<u64> = None;
-                        if gas_price_positive_active {
-                            // SAFETY: see `Storage::state_mut()` invariant.
-                            let state_ref = unsafe { arb_state_post.backing_storage.state_mut() };
-                            let _ = arb_state_post.l2_pricing_state.grow_backlog(
-                                state_ref,
-                                dist.compute_gas_for_backlog,
-                                used_multi_gas,
-                            );
-                            new_backlog =
-                                arb_state_post.l2_pricing_state.gas_backlog(state_ref).ok();
-                        }
-                        if !dist.l1_fees_to_add.is_zero() {
-                            // SAFETY: see `Storage::state_mut()` invariant.
-                            let state_ref = unsafe { arb_state_post.backing_storage.state_mut() };
-                            let _ = arb_state_post
-                                .l1_pricing_state
-                                .add_to_l1_fees_available(state_ref, dist.l1_fees_to_add);
-                        }
-
-                        (refund_done, new_backlog)
-                    };
-
-                    if refund_done {
-                        self.touched_accounts.insert(dist.network_fee_account);
-                        self.touched_accounts.insert(pending.sender);
-                    }
-                    if let Some(b) = new_backlog {
-                        self.precompile_ctx.block.set_current_gas_backlog(b);
                     }
                 }
-            }
 
-            // FixRedeemGas (ArbOS >= 11): subtract gas allocated to scheduled
-            // retry txs from this tx's gas_used for block rate limiting, since
-            // that gas will be accounted for when the retry tx itself executes.
-            let mut adjusted_gas_used = gas_used_total;
-            if self.arb_ctx.arbos_version
-                >= arb_chainspec::arbos_version::ARBOS_VERSION_FIX_REDEEM_GAS
-            {
-                if let Some(hooks) = self.arb_hooks.as_ref() {
-                    for scheduled in &hooks.tx_proc.scheduled_txs {
-                        if let Some(retry_gas) = decode_retry_tx_gas(scheduled) {
-                            adjusted_gas_used = adjusted_gas_used.saturating_sub(retry_gas);
-                        }
-                    }
-                }
-            }
-
-            // Block gas rate limiting: deduct compute gas from block budget.
-            const TX_GAS: u64 = 21_000;
-            let data_gas = pending.poster_gas;
-            let compute_used = if adjusted_gas_used < data_gas {
-                TX_GAS
-            } else {
-                let compute = adjusted_gas_used - data_gas;
-                if compute < TX_GAS {
+                // Block gas rate limiting: deduct compute gas from block budget.
+                const TX_GAS: u64 = 21_000;
+                let data_gas = pending.poster_gas;
+                let compute_used = if adjusted_gas_used < data_gas {
                     TX_GAS
                 } else {
-                    compute
-                }
-            };
-            self.block_gas_left = self.block_gas_left.saturating_sub(compute_used);
+                    let compute = adjusted_gas_used - data_gas;
+                    if compute < TX_GAS {
+                        TX_GAS
+                    } else {
+                        compute
+                    }
+                };
+                self.block_gas_left = self.block_gas_left.saturating_sub(compute_used);
 
-            // Track user txs for the ArbOS < 50 first-tx bypass.
-            let is_user_tx = !matches!(
-                pending.arb_tx_type,
-                Some(ArbTxType::ArbitrumInternalTx)
-                    | Some(ArbTxType::ArbitrumDepositTx)
-                    | Some(ArbTxType::ArbitrumSubmitRetryableTx)
-                    | Some(ArbTxType::ArbitrumRetryTx)
-            );
-            if is_user_tx {
-                self.user_txs_processed += 1;
+                // Track user txs for the ArbOS < 50 first-tx bypass.
+                let is_user_tx = !matches!(
+                    pending.arb_tx_type,
+                    Some(ArbTxType::ArbitrumInternalTx)
+                        | Some(ArbTxType::ArbitrumDepositTx)
+                        | Some(ArbTxType::ArbitrumSubmitRetryableTx)
+                        | Some(ArbTxType::ArbitrumRetryTx)
+                );
+                if is_user_tx {
+                    self.user_txs_processed += 1;
+                }
+
+                let _ = is_retry; // suppress unused warning
             }
 
-            let _ = is_retry; // suppress unused warning
-        }
+            self.precompile_ctx.reset_tx();
 
-        self.precompile_ctx.reset_tx();
-
-        // Per-tx Finalise: delete empty accounts from cache.
-        // Only iterates touched accounts (matching Go's journal.dirties).
-        // Accounts merely loaded (e.g. balance check) are not considered.
-        //
-        // Go's Finalise protects zombie accounts: an account is zombie-protected
-        // if ALL its journal dirty entries are createZombieChange entries.
-        // Our zombie_accounts set approximates this — if a zombie is subsequently
-        // dirtied by a non-zero transfer, it's removed from zombie_accounts
-        // (matching Go's dirtyCount > zombieEntries check).
-        {
-            let keccak_empty = alloy_primitives::B256::from(alloy_primitives::keccak256([]));
-            let overlay = &mut self.state_overlay;
-            let db: &mut State<DB> = self.inner.evm_mut().db_mut();
-            let to_remove: Vec<Address> = self
-                .touched_accounts
-                .drain()
-                .filter(|addr| {
-                    // Zombie accounts must be preserved even if empty.
-                    if self.zombie_accounts.contains(addr) {
-                        return false;
-                    }
-                    if let Some(cached) = db.cache.accounts.get(addr) {
-                        if let Some(ref acct) = cached.account {
-                            let is_empty = acct.info.nonce == 0
-                                && acct.info.balance.is_zero()
-                                && acct.info.code_hash == keccak_empty;
-                            return is_empty;
+            // Per-tx Finalise: delete empty accounts from cache.
+            // Only iterates touched accounts (matching Go's journal.dirties).
+            // Accounts merely loaded (e.g. balance check) are not considered.
+            //
+            // Go's Finalise protects zombie accounts: an account is zombie-protected
+            // if ALL its journal dirty entries are createZombieChange entries.
+            // Our zombie_accounts set approximates this — if a zombie is subsequently
+            // dirtied by a non-zero transfer, it's removed from zombie_accounts
+            // (matching Go's dirtyCount > zombieEntries check).
+            {
+                let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
+                let to_remove: Vec<Address> = self
+                    .touched_accounts
+                    .drain()
+                    .filter(|addr| {
+                        // Zombie accounts must be preserved even if empty.
+                        if self.zombie_accounts.contains(addr) {
+                            return false;
                         }
-                    }
-                    false
-                })
-                .collect();
+                        db.basic(*addr)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|info| info.is_empty())
+                    })
+                    .collect();
 
-            // Mark deleted accounts non-existent in the cache instead of
-            // removing them. Removing the entry would let the next same-block
-            // access reload stale data from the database (the Entry::Vacant
-            // path in load_cache_account). Keeping account=None with a
-            // non-existent status leaves a self-consistent entry, so both
-            // later accesses and any revert baseline captured from it see a
-            // genuinely absent account.
-            for addr in &to_remove {
-                overlay.record_pre_touch(db, *addr);
-                if let Some(cached) = db.cache.accounts.get_mut(addr) {
-                    cached.account = None;
-                    cached.status = revm_database::AccountStatus::LoadedNotExisting;
+                for addr in &to_remove {
+                    delete_account(db, *addr);
                 }
+                self.finalise_deleted.extend(to_remove);
             }
-            self.finalise_deleted.extend(to_remove);
-        }
 
-        {
-            let overlay = &mut self.state_overlay;
-            let db: &mut State<DB> = self.inner.evm_mut().db_mut();
-            overlay.drain_and_apply(db, &self.zombie_accounts);
-        }
+            Ok(gas_output)
+        })();
 
-        Ok(gas_used)
+        match committed {
+            Ok(gas) => gas,
+            Err(err) => {
+                self.deferred_error = Some(err);
+                fallback
+            }
+        }
     }
 
-    fn finish(self) -> Result<(Self::Evm, BlockExecutionResult<R::Receipt>), BlockExecutionError> {
+    fn finish(
+        mut self,
+    ) -> Result<(Self::Evm, BlockExecutionResult<R::Receipt>), BlockExecutionError> {
+        if let Some(err) = self.deferred_error.take() {
+            return Err(err);
+        }
         // Log if expected balance delta is non-zero (deposits/withdrawals occurred).
         if self.expected_balance_delta != 0 {
             tracing::trace!(
@@ -3122,7 +3109,7 @@ where
         let mut result = BlockExecutionResult {
             receipts: self.inner.receipts,
             requests: Default::default(),
-            gas_used: self.inner.gas_used,
+            gas_used: self.inner.cumulative_tx_gas_used,
             blob_gas_used: self.inner.blob_gas_used,
         };
         // Set Arbitrum-specific fields on each receipt from tracking vectors.
@@ -3135,10 +3122,6 @@ where
             }
         }
         Ok((self.inner.evm, result))
-    }
-
-    fn set_state_hook(&mut self, hook: Option<Box<dyn OnStateHook>>) {
-        self.inner.set_state_hook(hook);
     }
 
     fn evm_mut(&mut self) -> &mut Self::Evm {
@@ -3163,79 +3146,124 @@ where
 /// Used to account for poster gas (L1 data cost) which is deducted before
 /// EVM execution but must be reflected in the receipt's gas_used.
 fn adjust_result_gas_used<H>(result: &mut ExecutionResult<H>, extra_gas: u64) {
-    match result {
-        ExecutionResult::Success { gas_used, .. } => *gas_used = gas_used.saturating_add(extra_gas),
-        ExecutionResult::Revert { gas_used, .. } => *gas_used = gas_used.saturating_add(extra_gas),
-        ExecutionResult::Halt { gas_used, .. } => *gas_used = gas_used.saturating_add(extra_gas),
-    }
+    let gas = match result {
+        ExecutionResult::Success { gas, .. }
+        | ExecutionResult::Revert { gas, .. }
+        | ExecutionResult::Halt { gas, .. } => gas,
+    };
+    gas.set_total_gas_spent(gas.total_gas_spent().saturating_add(extra_gas));
+    // Preserve `max(spent - refund, floor) + extra` regardless of which side
+    // of the EIP-7623 maximum was active before the adjustment.
+    gas.set_floor_gas(gas.floor_gas().saturating_add(extra_gas));
+}
+
+/// Construct a result-gas snapshot whose receipt gas equals `gas_used`.
+/// Arbitrum does not activate EIP-8037 state gas, so synthetic results keep
+/// state gas at zero while retaining the effective refund separately.
+fn synthetic_result_gas(gas_used: u64, refunded: u64) -> ResultGas {
+    ResultGas::default()
+        .with_total_gas_spent(gas_used.saturating_add(refunded))
+        .with_refunded(refunded)
+}
+
+/// Commit one account-info update through Reth's generic state interface.
+fn commit_account_info<DB: StateDB>(
+    state: &mut DB,
+    address: Address,
+    current: Option<revm::state::AccountInfo>,
+    next: revm::state::AccountInfo,
+    create_if_missing: bool,
+) {
+    use alloy_primitives::map::AddressMap;
+    use revm::state::{Account, TransactionId};
+
+    let mut account = match current {
+        Some(info) => Account::from(info),
+        None => {
+            if !create_if_missing {
+                return;
+            }
+            let mut account = Account::new_not_existing(TransactionId::ZERO);
+            account.mark_created();
+            account
+        }
+    };
+    account.info = next;
+    account.mark_touch();
+    let mut changes = AddressMap::default();
+    changes.insert(address, account);
+    state.commit(changes);
+}
+
+fn delete_account<DB: StateDB>(state: &mut DB, address: Address) {
+    use alloy_primitives::map::AddressMap;
+    use revm::state::Account;
+
+    let Ok(Some(info)) = state.basic(address) else {
+        return;
+    };
+    let mut account = Account::from(info);
+    account.mark_selfdestruct();
+    account.mark_touch();
+    let mut changes = AddressMap::default();
+    changes.insert(address, account);
+    state.commit(changes);
 }
 
 /// Apply an unconditional AddBalance to the EVM state.
-fn apply_mint_to_state<DB: Database>(
-    state: &mut State<DB>,
-    overlay: &mut StateOverlay,
+fn apply_mint_to_state<DB: StateDB>(
+    state: &mut DB,
+    _overlay: &mut StateOverlay,
     address: Address,
     amount: U256,
 ) {
     if amount.is_zero() {
         return;
     }
-    overlay.record_pre_touch(state, address);
-    if let Some(cache_acct) = state.cache.accounts.get_mut(&address) {
-        if let Some(ref mut acct) = cache_acct.account {
-            acct.info.balance = acct.info.balance.saturating_add(amount);
-        } else {
-            cache_acct.account = Some(revm_database::states::plain_account::PlainAccount {
-                info: revm_state::AccountInfo {
-                    balance: amount,
-                    ..Default::default()
-                },
-                storage: Default::default(),
-            });
-        }
-    }
+    let Ok(current) = state.basic(address) else {
+        return;
+    };
+    let mut next = current.clone().unwrap_or_default();
+    next.balance = next.balance.saturating_add(amount);
+    commit_account_info(state, address, current, next, true);
 }
 
 /// Materialise an account as present-empty if it does not yet exist (an EIP-161
 /// zero-value touch). The per-tx Finalise then destructs the empty result and
 /// records it in `finalise_deleted`, so a later zero-value transfer can
 /// resurrect it via `create_zombie_if_deleted`.
-fn materialise_empty<DB: Database>(
-    state: &mut State<DB>,
-    overlay: &mut StateOverlay,
+fn materialise_empty<DB: StateDB>(
+    state: &mut DB,
+    _overlay: &mut StateOverlay,
     addr: Address,
     touched: &mut rustc_hash::FxHashSet<Address>,
 ) {
-    overlay.record_pre_touch(state, addr);
-    let _ = state.load_cache_account(addr);
-    if let Some(cached) = state.cache.accounts.get_mut(&addr) {
-        if cached.account.is_none() {
-            cached.account = Some(revm_database::states::plain_account::PlainAccount {
-                info: revm_state::AccountInfo::default(),
-                storage: Default::default(),
-            });
-            cached.status = revm_database::AccountStatus::InMemoryChange;
+    if let Ok(current) = state.basic(addr) {
+        if current.is_none() {
+            commit_account_info(state, addr, None, revm::state::AccountInfo::default(), true);
         }
     }
     touched.insert(addr);
 }
 
 /// Apply an unconditional SubBalance to the EVM state.
-fn apply_burn_to_state<DB: Database>(
-    state: &mut State<DB>,
-    overlay: &mut StateOverlay,
+fn apply_burn_to_state<DB: StateDB>(
+    state: &mut DB,
+    _overlay: &mut StateOverlay,
     address: Address,
     amount: U256,
 ) {
     if amount.is_zero() {
         return;
     }
-    overlay.record_pre_touch(state, address);
-    if let Some(cache_acct) = state.cache.accounts.get_mut(&address) {
-        if let Some(ref mut acct) = cache_acct.account {
-            acct.info.balance = acct.info.balance.saturating_sub(amount);
-        }
-    }
+    let Ok(current) = state.basic(address) else {
+        return;
+    };
+    let Some(mut next) = current.clone() else {
+        return;
+    };
+    next.balance = next.balance.saturating_sub(amount);
+    commit_account_info(state, address, current, next, false);
 }
 
 /// Backing state mutation for the typed transfer callback.
@@ -3245,8 +3273,8 @@ fn apply_burn_to_state<DB: Database>(
 ///     `BalanceError::InsufficientBalance` when `from` cannot cover `amount`.
 ///   - `(Some(from), None)` — unconditional burn (saturating, matches Go).
 ///   - `(None, Some(to))` — unconditional mint.
-fn apply_balance_op<DB: Database>(
-    state: &mut State<DB>,
+fn apply_balance_op<DB: StateDB>(
+    state: &mut DB,
     overlay: &mut StateOverlay,
     from: Option<&Address>,
     to: Option<&Address>,
@@ -3280,21 +3308,19 @@ fn apply_balance_op<DB: Database>(
 }
 
 /// Increment the nonce of an account.
-fn increment_nonce<DB: Database>(
-    state: &mut State<DB>,
-    overlay: &mut StateOverlay,
-    address: Address,
-) {
-    overlay.record_pre_touch(state, address);
-    if let Some(cache_acct) = state.cache.accounts.get_mut(&address) {
-        if let Some(ref mut acct) = cache_acct.account {
-            acct.info.nonce += 1;
-        }
-    }
+fn increment_nonce<DB: StateDB>(state: &mut DB, _overlay: &mut StateOverlay, address: Address) {
+    let Ok(current) = state.basic(address) else {
+        return;
+    };
+    let Some(mut next) = current.clone() else {
+        return;
+    };
+    next.nonce = next.nonce.saturating_add(1);
+    commit_account_info(state, address, current, next, false);
 }
 
 /// Read the balance of an account in the EVM state.
-fn get_balance<DB: Database>(state: &mut State<DB>, address: Address) -> U256 {
+fn get_balance<DB: Database>(state: &mut DB, address: Address) -> U256 {
     match revm::Database::basic(state, address) {
         Ok(Some(info)) => info.balance,
         _ => U256::ZERO,
@@ -3306,39 +3332,28 @@ fn get_balance<DB: Database>(state: &mut State<DB>, address: Address) -> U256 {
 /// (present in `finalise_deleted`) and no longer in cache, create a zombie.
 /// Go calls this for `from` in TransferBalance when amount == 0 and
 /// ArbOS version < Stylus.
-fn create_zombie_if_deleted<DB: Database>(
-    state: &mut State<DB>,
-    overlay: &mut StateOverlay,
+fn create_zombie_if_deleted<DB: StateDB>(
+    state: &mut DB,
+    _overlay: &mut StateOverlay,
     addr: Address,
     finalise_deleted: &rustc_hash::FxHashSet<Address>,
     zombie_accounts: &mut rustc_hash::FxHashSet<Address>,
     touched_accounts: &mut rustc_hash::FxHashSet<Address>,
 ) {
-    overlay.record_pre_touch(state, addr);
-    let account_missing = state
-        .cache
-        .accounts
-        .get(&addr)
-        .is_none_or(|c| c.account.is_none());
+    let account_missing = state.basic(addr).ok().flatten().is_none();
     if account_missing && finalise_deleted.contains(&addr) {
-        if let Some(cached) = state.cache.accounts.get_mut(&addr) {
-            cached.account = Some(revm_database::states::plain_account::PlainAccount {
-                info: revm_state::AccountInfo::default(),
-                storage: Default::default(),
-            });
-            cached.status = revm_database::AccountStatus::InMemoryChange;
-        }
+        commit_account_info(state, addr, None, revm::state::AccountInfo::default(), true);
         zombie_accounts.insert(addr);
         touched_accounts.insert(addr);
     }
 }
 
 /// Apply a computed fee distribution to the EVM state.
-fn apply_fee_distribution<DB: Database>(
-    state: &mut State<DB>,
+fn apply_fee_distribution<DB: StateDB + arb_storage::StorageBackend>(
+    state: &mut DB,
     overlay: &mut StateOverlay,
     dist: &EndTxFeeDistribution,
-    l1_pricing: Option<&l1_pricing::L1PricingState<DB>>,
+    l1_pricing: Option<&l1_pricing::L1PricingState<Detached>>,
 ) {
     // Skip the 0-value mint to avoid an EIP-161 touch on the network
     // fee account.
@@ -3513,8 +3528,8 @@ fn decode_extra_fields(extra_bytes: &[u8]) -> (u64, u64) {
 /// EIP-2935: Store the parent block hash in the history storage contract.
 ///
 /// For Arbitrum, uses L2 block numbers and a buffer size of 393168 blocks.
-fn process_parent_block_hash<DB: Database>(
-    state: &mut State<DB>,
+fn process_parent_block_hash<DB: arb_storage::StorageBackend>(
+    state: &mut DB,
     l2_block_number: u64,
     prev_hash: B256,
 ) {
@@ -3530,8 +3545,10 @@ fn process_parent_block_hash<DB: Database>(
     let slot = U256::from((l2_block_number - 1) % HISTORY_SERVE_WINDOW);
     let value = U256::from_be_slice(prev_hash.as_slice());
 
-    arb_storage::write_storage_at(state, HISTORY_STORAGE_ADDRESS, slot, value)
-        .expect("HISTORY_STORAGE write must succeed: in-memory state writes are infallible");
+    arb_storage::StorageBackend::sstore(state, HISTORY_STORAGE_ADDRESS, slot, value)
+        .unwrap_or_else(|_| {
+            panic!("HISTORY_STORAGE write must succeed: executor state writes are infallible")
+        });
 }
 
 /// Extract the gas field from a scheduled retry tx's encoded bytes.

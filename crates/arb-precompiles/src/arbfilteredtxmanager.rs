@@ -4,7 +4,8 @@ use alloy_sol_types::{SolEvent, SolInterface};
 use arb_context::ArbPrecompileCtx;
 use arb_storage::{ARBOS_STATE_ADDRESS, FILTERED_TX_STATE_ADDRESS};
 
-use revm::precompile::{PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult};
+use crate::{ArbPrecompileOutput as PrecompileOutput, ArbPrecompileResult as PrecompileResult};
+use revm::precompile::PrecompileId;
 use std::sync::Arc;
 
 use crate::{interfaces::IArbFilteredTxManager, ArbPrecompileError};
@@ -22,9 +23,7 @@ const COPY_GAS: u64 = 3;
 const LOG_GAS: u64 = 375 + 2 * 375;
 
 pub fn create_arbfilteredtxmanager_precompile(ctx: Arc<ArbPrecompileCtx>) -> DynPrecompile {
-    DynPrecompile::new_stateful(PrecompileId::custom("arbfilteredtxmanager"), move |input| {
-        handler(input, &ctx)
-    })
+    crate::new_arb_precompile(PrecompileId::custom("arbfilteredtxmanager"), ctx, handler)
 }
 
 fn handler(mut input: PrecompileInput<'_>, ctx: &ArbPrecompileCtx) -> PrecompileResult {
@@ -123,7 +122,7 @@ fn handler(mut input: PrecompileInput<'_>, ctx: &ArbPrecompileCtx) -> Precompile
             output.gas_used = final_gas;
             Ok(output)
         }
-        Err(PrecompileError::Other(_)) => Ok(PrecompileOutput::new_reverted(
+        Err(ArbPrecompileError::Revert { .. }) => Ok(PrecompileOutput::new_reverted(
             final_gas,
             Default::default(),
         )),

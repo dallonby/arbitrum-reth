@@ -1,5 +1,4 @@
 use alloy_primitives::U256;
-use revm::Database;
 
 use arb_math::ONE_IN_BIPS;
 use arb_storage::{Storage, StorageBackedUint32, StorageBackedUint64, StorageBackend};
@@ -32,7 +31,7 @@ pub struct DataPricer {
     pub inertia: StorageBackedUint32,
 }
 
-pub fn init_data_pricer<D: Database, B: StorageBackend>(
+pub fn init_data_pricer<D, B: StorageBackend>(
     sto: &Storage<'_, D>,
     backend: &mut B,
 ) -> Result<(), ProgramsError> {

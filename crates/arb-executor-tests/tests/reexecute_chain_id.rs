@@ -49,6 +49,7 @@ fn pre_execution_sources_chain_id_from_cfg_when_defaulted() {
         ommers: &[],
         withdrawals: None,
         extra_data: vec![0u8; 32].into(),
+        slot_number: None,
     };
     // A chain id of 0 mirrors the trait `create_executor` path used by re-execute.
     let mut executor = cfg

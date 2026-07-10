@@ -91,6 +91,7 @@ fn exec_ctx() -> EthBlockExecutionCtx<'static> {
         ommers: &[],
         withdrawals: None,
         extra_data: vec![0u8; 32].into(),
+        slot_number: None,
     }
 }
 
@@ -160,7 +161,7 @@ fn run_without_inspector() -> PostState {
     let result = executor
         .execute_transaction_without_commit(call_contract_tx())
         .unwrap();
-    executor.commit_transaction(result).unwrap();
+    executor.commit_transaction(result);
     executor.finish().unwrap();
     read_post_state(&mut h)
 }
@@ -185,7 +186,7 @@ fn run_with_inspector() -> PostState {
     let result = executor
         .execute_transaction_without_commit(call_contract_tx())
         .unwrap();
-    executor.commit_transaction(result).unwrap();
+    executor.commit_transaction(result);
     executor.finish().unwrap();
     read_post_state(&mut h)
 }

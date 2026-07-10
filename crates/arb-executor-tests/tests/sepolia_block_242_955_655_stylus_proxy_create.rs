@@ -274,6 +274,7 @@ fn run_scenario(activated_at_hours: u32) -> ScenarioOutcome {
         ommers: &[],
         withdrawals: None,
         extra_data: vec![0u8; 32].into(),
+        slot_number: None,
     };
     let mut executor = cfg
         .block_executor_factory()
@@ -290,7 +291,7 @@ fn run_scenario(activated_at_hours: u32) -> ScenarioOutcome {
         .execute_transaction_without_commit(recovered)
         .expect("execute tx");
 
-    let gas_used = exec_result.result.result.gas_used();
+    let gas_used = exec_result.result.result.tx_gas_used();
     let success = exec_result.result.result.is_success();
 
     ScenarioOutcome { success, gas_used }

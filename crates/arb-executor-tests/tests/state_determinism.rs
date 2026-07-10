@@ -51,6 +51,7 @@ fn run_block(
         ommers: &[],
         withdrawals: None,
         extra_data: vec![0u8; 32].into(),
+        slot_number: None,
     };
     let mut executor = cfg
         .block_executor_factory()
@@ -64,7 +65,7 @@ fn run_block(
         match executor.execute_transaction_without_commit(recovered) {
             Ok(result) => {
                 let ok = result.result.result.is_success();
-                executor.commit_transaction(result).expect("commit");
+                executor.commit_transaction(result);
                 results.push(ok);
             }
             Err(_) => results.push(false),

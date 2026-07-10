@@ -61,7 +61,7 @@ fn run(target_code: Vec<u8>, callee_code: Option<Vec<u8>>) -> (u64, MultiGas) {
         .unwrap();
 
     assert!(result.is_success(), "tx reverted: {result:?}");
-    let gas_used = result.gas_used();
+    let gas_used = result.tx_gas_used();
     drop(evm);
     (gas_used, inspector.take_multi_gas())
 }

@@ -14,6 +14,7 @@ pub mod executor;
 pub mod hooks;
 pub mod multi_gas;
 pub mod receipt;
+pub mod sequencer;
 pub mod state_overlay;
 pub mod transaction;
 
@@ -30,4 +31,8 @@ pub use evm::{ArbEvm, ArbEvmFactory};
 pub use executor::DefaultArbOsHooks;
 pub use hooks::{ArbOsHooks, NoopArbOsHooks};
 pub use receipt::ArbReceiptBuilder;
+pub use sequencer::{
+    execute_sequencer_block, ExecutedSequencerBlock, SequencerBlockInput, SequencerBlockState,
+    SequencerTransactionExecution,
+};
 pub use transaction::ArbTransaction;

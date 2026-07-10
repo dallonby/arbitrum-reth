@@ -190,6 +190,7 @@ fn sepolia_269589702_sender_net_charge_matches_canonical() {
         ommers: &[],
         withdrawals: None,
         extra_data: vec![0u8; 32].into(),
+        slot_number: None,
     };
     let mut executor = cfg
         .block_executor_factory()
@@ -211,7 +212,7 @@ fn sepolia_269589702_sender_net_charge_matches_canonical() {
     let r = executor
         .execute_transaction_without_commit(Recovered::new_unchecked(sb, ARBOS_ADDRESS))
         .expect("startblock");
-    executor.commit_transaction(r).expect("commit sb");
+    executor.commit_transaction(r);
 
     // User tx.
     let tx = build_user_tx();
@@ -220,7 +221,7 @@ fn sepolia_269589702_sender_net_charge_matches_canonical() {
     let r = executor
         .execute_transaction_without_commit(recovered)
         .expect("user tx");
-    executor.commit_transaction(r).expect("commit user");
+    executor.commit_transaction(r);
     let _ = executor.finish().expect("finish");
 
     let got = read_balance(harness.state(), SENDER);

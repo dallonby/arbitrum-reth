@@ -12,6 +12,7 @@ pub mod engine;
 pub mod error;
 pub mod genesis;
 pub mod launcher;
+pub mod live_ipc;
 pub mod network;
 pub mod payload;
 pub mod pool;
@@ -48,7 +49,7 @@ use crate::{
     network::ArbNetworkBuilder,
     payload::ArbPayloadServiceBuilder,
     pool::ArbPoolBuilder,
-    producer::{ArbBlockProducer, InMemoryStateAccess},
+    producer::{ArbBlockProducer, InMemoryStateAccess, StateRootConfig},
 };
 
 /// Arbitrum RPC add-ons type alias.
@@ -141,6 +142,7 @@ where
             BasicEngineApiBuilder::default(),
             BasicEngineValidatorBuilder::default(),
             Default::default(),
+            Default::default(),
         )
         .extend_rpc_modules(register_arb_rpc)
     }
@@ -231,12 +233,52 @@ where
         .and_then(|v| v.parse().ok())
         .unwrap_or(producer::DEFAULT_FLUSH_INTERVAL);
 
+    let rollup_args = args::runtime_args();
+    validate_live_ipc_mode(&rollup_args)?;
+    let verify_every = if rollup_args.state_root_verify_every == 0 {
+        std::env::var("ARB_STATE_ROOT_VERIFY_EVERY")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+    } else {
+        rollup_args.state_root_verify_every
+    };
+    let state_root_config = StateRootConfig {
+        skip_validation: rollup_args.skip_state_root_validation,
+        algorithm: rollup_args.state_root_algorithm,
+        verify_every,
+    };
+
+    let live_ipc = if rollup_args.live_ipc_enabled {
+        let publisher = live_ipc::UdsPublisher::bind(
+            rollup_args.live_ipc_uds_path.clone(),
+            rollup_args.live_ipc_queue_capacity,
+            rollup_args.live_ipc_client_queue_capacity,
+            rollup_args.live_ipc_replay_capacity,
+            rollup_args.live_ipc_replay_byte_capacity,
+        )?;
+        tracing::info!(
+            target: "live_ipc",
+            path = %rollup_args.live_ipc_uds_path.display(),
+            queue_capacity = rollup_args.live_ipc_queue_capacity,
+            client_queue_capacity = rollup_args.live_ipc_client_queue_capacity,
+            replay_capacity = rollup_args.live_ipc_replay_capacity,
+            replay_byte_capacity = rollup_args.live_ipc_replay_byte_capacity,
+            "low-latency canonical state-diff feed enabled"
+        );
+        Some(Arc::new(publisher))
+    } else {
+        None
+    };
+
     let block_producer = Arc::new(ArbBlockProducer::new(
         ctx.provider().clone(),
         chain_spec,
         evm_config,
         in_memory_state,
         flush_interval,
+        state_root_config,
+        live_ipc,
     ));
 
     let nitro_exec =
@@ -245,7 +287,68 @@ where
     ctx.modules.merge_configured(nitro_rpc.clone())?;
     ctx.auth_module.merge_auth_methods(nitro_rpc)?;
 
+    if state_root_config.skip_validation {
+        let mut unavailable = jsonrpsee::RpcModule::new(());
+        unavailable.register_method("eth_getProof", |_, _, _| {
+            Err::<serde_json::Value, _>(jsonrpsee::types::ErrorObjectOwned::owned(
+                -32004,
+                "eth_getProof is unavailable while state-root validation is skipped",
+                None::<()>,
+            ))
+        })?;
+        unavailable.register_method("eth_getAccount", |_, _, _| {
+            Err::<serde_json::Value, _>(jsonrpsee::types::ErrorObjectOwned::owned(
+                -32004,
+                "eth_getAccount is unavailable while state-root validation is skipped",
+                None::<()>,
+            ))
+        })?;
+        ctx.modules.add_or_replace_if_module_configured(
+            reth_rpc_server_types::RethRpcModule::Eth,
+            unavailable,
+        )?;
+    }
+
     Ok(())
+}
+
+fn validate_live_ipc_mode(rollup_args: &RollupArgs) -> eyre::Result<()> {
+    eyre::ensure!(
+        !(rollup_args.live_ipc_enabled && rollup_args.skip_state_root_validation),
+        "--bot-live-exex.enabled requires canonical state roots and cannot be combined with \
+         --engine.skip-state-root-validation"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod live_ipc_mode_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_noncanonical_live_ipc_mode() {
+        let args = RollupArgs {
+            live_ipc_enabled: true,
+            skip_state_root_validation: true,
+            ..Default::default()
+        };
+        assert!(validate_live_ipc_mode(&args).is_err());
+    }
+
+    #[test]
+    fn accepts_each_mode_independently() {
+        let canonical_feed = RollupArgs {
+            live_ipc_enabled: true,
+            ..Default::default()
+        };
+        assert!(validate_live_ipc_mode(&canonical_feed).is_ok());
+
+        let isolated_fast_mode = RollupArgs {
+            skip_state_root_validation: true,
+            ..Default::default()
+        };
+        assert!(validate_live_ipc_mode(&isolated_fast_mode).is_ok());
+    }
 }
 
 /// Builder for the Arbitrum consensus component.

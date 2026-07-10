@@ -1,7 +1,7 @@
 use alloy_evm::{
     eth::EthEvmContext, precompiles::PrecompilesMap, Database, Evm, EvmEnv, EvmFactory,
 };
-use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy_primitives::{map::AddressSet, Address, Bytes, B256, U256};
 use arb_precompiles::register_arb_precompiles;
 use arb_stylus::{
     config::StylusConfig, ink::Gas as StylusGas, meter::MeteredMachine, run::RunProgram,
@@ -10,6 +10,7 @@ use arb_stylus::{
 use arbos::programs::types::EvmData;
 use core::fmt::Debug;
 use revm::{
+    bytecode::opcode,
     context::{
         result::{EVMError, ExecutionResult, InvalidTransaction},
         ContextSetters, Evm as RevmEvm, FrameStack,
@@ -20,14 +21,16 @@ use revm::{
         ContextTr, JournalTr,
     },
     handler::{
-        instructions::EthInstructions, EthFrame, EvmTr, FrameResult, Handler, ItemOrResult,
-        MainnetHandler, PrecompileProvider,
+        instructions::EthInstructions, EthFrame, EvmTr, FrameInitOrResult, FrameResult, Handler,
+        ItemOrResult, MainnetHandler, PrecompileProvider,
     },
     inspector::{InspectorHandler, NoOpInspector},
     interpreter::{
+        instructions::{GasTable, InstructionTable},
         interpreter::EthInterpreter,
-        interpreter_action::FrameInit,
-        interpreter_types::{InputsTr, ReturnData, RuntimeFlag, StackTr},
+        interpreter::Interpreter,
+        interpreter_action::{FrameInit, InterpreterAction},
+        interpreter_types::{InputsTr, Jumps, LoopControl, ReturnData, RuntimeFlag, StackTr},
         CallInput, CallInputs, CallOutcome, CallScheme, FrameInput, Gas as EvmGas, Host,
         InstructionContext, InstructionResult, InterpreterResult, InterpreterTypes,
     },
@@ -57,11 +60,14 @@ const BALANCE_OPCODE: u8 = 0x31;
 /// `block_env.number` is configured to hold the L1 block number for Arbitrum
 /// EVM execution; reading the host preserves consensus semantics without
 /// touching any per-thread global.
-fn arb_number<WIRE: InterpreterTypes, H: Host + ?Sized>(ctx: InstructionContext<'_, H, WIRE>) {
+fn arb_number<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    ctx: InstructionContext<'_, H, WIRE>,
+) -> revm::interpreter::InstructionExecResult {
     let l1_block = ctx.host.block_number();
     if !ctx.interpreter.stack.push(l1_block) {
-        ctx.interpreter.halt(InstructionResult::StackOverflow);
+        return Err(InstructionResult::StackOverflow);
     }
+    Ok(())
 }
 
 /// Arbitrum BLOCKHASH: uses L1 block number for range check.
@@ -70,45 +76,44 @@ fn arb_number<WIRE: InterpreterTypes, H: Host + ?Sized>(ctx: InstructionContext<
 /// which is the L2 block number. Since Arbitrum's NUMBER opcode returns the L1
 /// block number, BLOCKHASH must also use L1 block numbers for the range check.
 /// Otherwise requests for L1 block hashes would always be out of range.
-fn arb_blockhash<WIRE: InterpreterTypes, H: Host + ?Sized>(ctx: InstructionContext<'_, H, WIRE>) {
+fn arb_blockhash<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    ctx: InstructionContext<'_, H, WIRE>,
+) -> revm::interpreter::InstructionExecResult {
     use revm::interpreter::InstructionResult;
 
     let requested = match ctx.interpreter.stack.pop() {
         Some(v) => v,
-        None => {
-            ctx.interpreter.halt(InstructionResult::StackUnderflow);
-            return;
-        }
+        None => return Err(InstructionResult::StackUnderflow),
     };
 
     let l1_block_number = ctx.host.block_number();
 
     let Some(diff) = l1_block_number.checked_sub(requested) else {
         if !ctx.interpreter.stack.push(U256::ZERO) {
-            ctx.interpreter.halt(InstructionResult::StackOverflow);
+            return Err(InstructionResult::StackOverflow);
         }
-        return;
+        return Ok(());
     };
 
     let diff_u64: u64 = diff.try_into().unwrap_or(u64::MAX);
     if diff_u64 == 0 || diff_u64 > 256 {
         if !ctx.interpreter.stack.push(U256::ZERO) {
-            ctx.interpreter.halt(InstructionResult::StackOverflow);
+            return Err(InstructionResult::StackOverflow);
         }
-        return;
+        return Ok(());
     }
 
     let requested_u64: u64 = requested.try_into().unwrap_or(u64::MAX);
-    match ctx.host.block_hash(requested_u64) {
+    let cached = L1_BLOCK_HASHES.with(|cache| cache.borrow().get(&requested_u64).copied());
+    match cached.or_else(|| ctx.host.block_hash(requested_u64)) {
         Some(hash) => {
             if !ctx.interpreter.stack.push(U256::from_be_bytes(hash.0)) {
-                ctx.interpreter.halt(InstructionResult::StackOverflow);
+                return Err(InstructionResult::StackOverflow);
             }
         }
-        None => {
-            ctx.interpreter.halt_fatal();
-        }
+        None => return Err(InstructionResult::FatalExternalError),
     }
+    Ok(())
 }
 
 // SHA3 tracer removed — can't easily wrap standard handler
@@ -116,14 +121,12 @@ fn arb_blockhash<WIRE: InterpreterTypes, H: Host + ?Sized>(ctx: InstructionConte
 /// Arbitrum BALANCE: subtracts the poster-fee correction when a contract
 /// reads the transaction sender's balance, so that the observed value matches
 /// a full-`gas_limit * basefee` buy-gas charge.
-fn arb_balance<WIRE: InterpreterTypes, H: Host + ?Sized>(ctx: InstructionContext<'_, H, WIRE>) {
+fn arb_balance<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    ctx: InstructionContext<'_, H, WIRE>,
+) -> revm::interpreter::InstructionExecResult {
     let addr_u256 = match ctx.interpreter.stack.pop() {
         Some(v) => v,
-        None => {
-            ctx.interpreter
-                .halt(revm::interpreter::InstructionResult::StackUnderflow);
-            return;
-        }
+        None => return Err(InstructionResult::StackUnderflow),
     };
 
     let addr = alloy_primitives::Address::from_word(alloy_primitives::B256::from(
@@ -136,14 +139,11 @@ fn arb_balance<WIRE: InterpreterTypes, H: Host + ?Sized>(ctx: InstructionContext
     let spec_id = ctx.interpreter.runtime_flag.spec_id();
     if spec_id.is_enabled_in(revm::primitives::hardfork::SpecId::BERLIN) {
         let Some(state_load) = ctx.host.balance(addr) else {
-            ctx.interpreter.halt_fatal();
-            return;
+            return Err(InstructionResult::FatalExternalError);
         };
         let gas_cost = if state_load.is_cold { 2600u64 } else { 100u64 };
-        if !ctx.interpreter.gas.record_cost(gas_cost) {
-            ctx.interpreter
-                .halt(revm::interpreter::InstructionResult::OutOfGas);
-            return;
+        if !ctx.interpreter.gas.record_regular_cost(gas_cost) {
+            return Err(InstructionResult::OutOfGas);
         }
 
         let balance = if addr == sender {
@@ -153,13 +153,11 @@ fn arb_balance<WIRE: InterpreterTypes, H: Host + ?Sized>(ctx: InstructionContext
         };
 
         if !ctx.interpreter.stack.push(balance) {
-            ctx.interpreter
-                .halt(revm::interpreter::InstructionResult::StackOverflow);
+            return Err(InstructionResult::StackOverflow);
         }
     } else {
         let Some(state_load) = ctx.host.balance(addr) else {
-            ctx.interpreter.halt_fatal();
-            return;
+            return Err(InstructionResult::FatalExternalError);
         };
 
         let balance = if addr == sender {
@@ -169,10 +167,10 @@ fn arb_balance<WIRE: InterpreterTypes, H: Host + ?Sized>(ctx: InstructionContext
         };
 
         if !ctx.interpreter.stack.push(balance) {
-            ctx.interpreter
-                .halt(revm::interpreter::InstructionResult::StackOverflow);
+            return Err(InstructionResult::StackOverflow);
         }
     }
+    Ok(())
 }
 
 /// SELFBALANCE opcode (0x47).
@@ -180,12 +178,13 @@ const SELFBALANCE_OPCODE: u8 = 0x47;
 
 /// Arbitrum SELFBALANCE: adjusts for poster fee correction if the executing
 /// contract IS the tx sender (edge case: sender calls own address).
-fn arb_selfbalance<WIRE: InterpreterTypes, H: Host + ?Sized>(ctx: InstructionContext<'_, H, WIRE>) {
+fn arb_selfbalance<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    ctx: InstructionContext<'_, H, WIRE>,
+) -> revm::interpreter::InstructionExecResult {
     let target = ctx.interpreter.input.target_address();
 
     let Some(state_load) = ctx.host.balance(target) else {
-        ctx.interpreter.halt_fatal();
-        return;
+        return Err(InstructionResult::FatalExternalError);
     };
 
     let sender = ctx.host.caller();
@@ -198,9 +197,9 @@ fn arb_selfbalance<WIRE: InterpreterTypes, H: Host + ?Sized>(ctx: InstructionCon
     };
 
     if !ctx.interpreter.stack.push(balance) {
-        ctx.interpreter
-            .halt(revm::interpreter::InstructionResult::StackOverflow);
+        return Err(InstructionResult::StackOverflow);
     }
+    Ok(())
 }
 
 // EVM opcodes are wired into revm via a `[Instruction; 256]` table built from
@@ -213,6 +212,20 @@ fn arb_selfbalance<WIRE: InterpreterTypes, H: Host + ?Sized>(ctx: InstructionCon
 // `thread_local!` by the lint job in `.github/workflows/lint.yml`.
 thread_local! {
     static POSTER_BALANCE_CORRECTION: std::cell::Cell<u128> = const { std::cell::Cell::new(0) };
+    static L1_BLOCK_HASHES: std::cell::RefCell<std::collections::HashMap<u64, B256>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Replace the recent L1 block-hash window observed by Arbitrum's BLOCKHASH
+/// opcode. Reth 2.3's generic StateDB deliberately does not expose its private
+/// block-hash cache, so the executor stages ArbOS' L1 hashes beside the other
+/// per-thread opcode context.
+pub(crate) fn replace_l1_block_hashes(values: impl IntoIterator<Item = (u64, B256)>) {
+    L1_BLOCK_HASHES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.clear();
+        cache.extend(values);
+    });
 }
 
 /// Publish the poster-balance correction word for the active tx so that
@@ -232,20 +245,18 @@ fn poster_balance_correction_word() -> U256 {
 
 /// BLOBBASEFEE is not supported on Arbitrum — execution halts.
 fn arb_blob_basefee<WIRE: InterpreterTypes, H: Host + ?Sized>(
-    ctx: InstructionContext<'_, H, WIRE>,
-) {
-    ctx.interpreter.halt(InstructionResult::OpcodeNotFound);
+    _ctx: InstructionContext<'_, H, WIRE>,
+) -> revm::interpreter::InstructionExecResult {
+    Err(InstructionResult::OpcodeNotFound)
 }
 
 /// Arbitrum SELFDESTRUCT: reverts if the acting account is a Stylus program,
 /// otherwise delegates to the standard EIP-6780 selfdestruct logic.
 fn arb_selfdestruct<WIRE: InterpreterTypes, H: Host + ?Sized>(
     ctx: InstructionContext<'_, H, WIRE>,
-) {
+) -> revm::interpreter::InstructionExecResult {
     if ctx.interpreter.runtime_flag.is_static() {
-        ctx.interpreter
-            .halt(InstructionResult::StateChangeDuringStaticCall);
-        return;
+        return Err(InstructionResult::StateChangeDuringStaticCall);
     }
 
     // Stylus programs cannot be self-destructed.
@@ -253,22 +264,17 @@ fn arb_selfdestruct<WIRE: InterpreterTypes, H: Host + ?Sized>(
     match ctx.host.load_account_code(acting_addr) {
         Some(code_load) => {
             if arb_stylus::is_stylus_runnable(&code_load.data) {
-                ctx.interpreter.halt(InstructionResult::Revert);
-                return;
+                return Err(InstructionResult::Revert);
             }
         }
-        None => {
-            ctx.interpreter.halt_fatal();
-            return;
-        }
+        None => return Err(InstructionResult::FatalExternalError),
     }
 
     // Standard selfdestruct logic (matching revm's EIP-6780 implementation).
     // Pop U256 and convert to Address manually (avoids pop_address() which
     // triggers a ruint 1.17 const eval panic due to U256->Address byte size mismatch).
     let Some(raw) = ctx.interpreter.stack.pop() else {
-        ctx.interpreter.halt(InstructionResult::StackUnderflow);
-        return;
+        return Err(InstructionResult::StackUnderflow);
     };
     let target = Address::from_word(alloy_primitives::B256::from(raw.to_be_bytes()));
 
@@ -278,14 +284,8 @@ fn arb_selfdestruct<WIRE: InterpreterTypes, H: Host + ?Sized>(
 
     let res = match ctx.host.selfdestruct(acting_addr, target, skip_cold_load) {
         Ok(res) => res,
-        Err(LoadError::ColdLoadSkipped) => {
-            ctx.interpreter.halt_oog();
-            return;
-        }
-        Err(LoadError::DBError) => {
-            ctx.interpreter.halt_fatal();
-            return;
-        }
+        Err(LoadError::ColdLoadSkipped) => return Err(InstructionResult::OutOfGas),
+        Err(LoadError::DBError) => return Err(InstructionResult::FatalExternalError),
     };
 
     // EIP-161: State trie clearing.
@@ -299,9 +299,8 @@ fn arb_selfdestruct<WIRE: InterpreterTypes, H: Host + ?Sized>(
         .host
         .gas_params()
         .selfdestruct_cost(should_charge_topup, res.is_cold);
-    if !ctx.interpreter.gas.record_cost(gas_cost) {
-        ctx.interpreter.halt_oog();
-        return;
+    if !ctx.interpreter.gas.record_regular_cost(gas_cost) {
+        return Err(InstructionResult::OutOfGas);
     }
 
     if !res.previously_destroyed {
@@ -310,7 +309,7 @@ fn arb_selfdestruct<WIRE: InterpreterTypes, H: Host + ?Sized>(
             .record_refund(ctx.host.gas_params().selfdestruct_refund());
     }
 
-    ctx.interpreter.halt(InstructionResult::SelfDestruct);
+    Err(InstructionResult::SelfDestruct)
 }
 
 /// Reset per-tx Stylus state at the start of every transaction.
@@ -611,7 +610,9 @@ where
         scheme: call_scheme,
         is_static,
         return_memory_offset: 0..0,
-        known_bytecode: None,
+        known_bytecode: (B256::ZERO, revm::state::Bytecode::default()),
+        reservoir: 0,
+        charged_new_account_state_gas: false,
     };
 
     {
@@ -962,7 +963,9 @@ where
         scheme: CallScheme::Call,
         is_static: false,
         return_memory_offset: 0..0,
-        known_bytecode: None,
+        known_bytecode: (B256::ZERO, revm::state::Bytecode::default()),
+        reservoir: 0,
+        charged_new_account_state_gas: false,
     };
 
     let result = run_evm_bytecode(context, &init_inputs, code, gas, pre_ctx);
@@ -1097,27 +1100,33 @@ where
     >::new_mainnet_with_spec(spec.into());
     instructions.insert_instruction(
         BLOBBASEFEE_OPCODE,
-        revm::interpreter::Instruction::new(arb_blob_basefee, 2),
+        revm::interpreter::Instruction::new(arb_blob_basefee),
+        2,
     );
     instructions.insert_instruction(
         SELFDESTRUCT_OPCODE,
-        revm::interpreter::Instruction::new(arb_selfdestruct, 5000),
+        revm::interpreter::Instruction::new(arb_selfdestruct),
+        5000,
     );
     instructions.insert_instruction(
         NUMBER_OPCODE,
-        revm::interpreter::Instruction::new(arb_number, 2),
+        revm::interpreter::Instruction::new(arb_number),
+        2,
     );
     instructions.insert_instruction(
         BLOCKHASH_OPCODE,
-        revm::interpreter::Instruction::new(arb_blockhash, 20),
+        revm::interpreter::Instruction::new(arb_blockhash),
+        20,
     );
     instructions.insert_instruction(
         BALANCE_OPCODE,
-        revm::interpreter::Instruction::new(arb_balance, 0),
+        revm::interpreter::Instruction::new(arb_balance),
+        0,
     );
     instructions.insert_instruction(
         SELFBALANCE_OPCODE,
-        revm::interpreter::Instruction::new(arb_selfbalance, 5),
+        revm::interpreter::Instruction::new(arb_selfbalance),
+        5,
     );
 
     // Attribute this EVM sub-frame's opcodes by multi-gas dimension so a Stylus
@@ -1131,7 +1140,8 @@ where
             context,
             &mut interpreter,
             &mut multi_gas_inspector,
-            &instructions.instruction_table,
+            instructions.instruction_table(),
+            instructions.gas_table(),
         );
 
         match action {
@@ -1401,9 +1411,7 @@ where
     if total_gas < upfront_cost {
         // Only the outermost Stylus frame leaves its abort gas undimensioned; a
         // Stylus ancestor folds a nested abort into its own computation.
-        if arbos_version >= arb_chainspec::arbos_version::ARBOS_VERSION_MULTI_GAS_REFUND_FIX
-            && stylus_frame_depth == 1
-        {
+        if stylus_frame_depth == 1 {
             ctx.add_stylus_upfront_oog_gas(total_gas);
         }
         return InterpreterResult::new(InstructionResult::OutOfGas, Bytes::new(), zero_gas());
@@ -1704,11 +1712,10 @@ fn is_stylus_call(frame_init: &FrameInit, arbos_version: u64) -> Option<Bytes> {
         return None;
     }
     if let FrameInput::Call(ref inputs) = frame_init.frame_input {
-        if let Some((_, ref code)) = inputs.known_bytecode {
-            let raw = code.original_bytes();
-            if arb_stylus::is_stylus_runnable(&raw) {
-                return Some(raw);
-            }
+        let (_, code) = &inputs.known_bytecode;
+        let raw = code.original_bytes();
+        if arb_stylus::is_stylus_runnable(&raw) {
+            return Some(raw);
         }
     }
     None
@@ -1736,6 +1743,7 @@ fn execute_stylus_call_concrete<DB: Database>(
                 memory_offset: inputs.return_memory_offset.clone(),
                 was_precompile_called: false,
                 precompile_call_logs: Vec::new(),
+                charged_new_account_state_gas: inputs.charged_new_account_state_gas,
             });
         }
     }
@@ -1752,12 +1760,13 @@ fn execute_stylus_call_concrete<DB: Database>(
         memory_offset: inputs.return_memory_offset.clone(),
         was_precompile_called: false,
         precompile_call_logs: Vec::new(),
+        charged_new_account_state_gas: inputs.charged_new_account_state_gas,
     })
 }
 
 // ── Precompile provider ────────────────────────────────────────────
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ArbPrecompilesMap {
     pub inner: PrecompilesMap,
     /// Per-block context shared with the registered precompile closures and
@@ -1810,21 +1819,20 @@ where
         if arbos_version >= arb_chainspec::arbos_version::ARBOS_VERSION_STYLUS {
             // Use known_bytecode from CallInputs if available (already loaded by
             // revm's CALL handler), otherwise load from journal.
-            let bytecode = inputs
-                .known_bytecode
-                .as_ref()
-                .map(|(_, code)| code.original_bytes())
-                .or_else(|| {
-                    context
-                        .journaled_state
-                        .inner
-                        .load_code(
-                            &mut context.journaled_state.database,
-                            inputs.bytecode_address,
-                        )
-                        .ok()
-                        .and_then(|acc| acc.data.info.code.as_ref().map(|c| c.original_bytes()))
-                });
+            let known_bytecode = inputs.known_bytecode.1.original_bytes();
+            let bytecode = if known_bytecode.is_empty() {
+                context
+                    .journaled_state
+                    .inner
+                    .load_code(
+                        &mut context.journaled_state.database,
+                        inputs.bytecode_address,
+                    )
+                    .ok()
+                    .and_then(|acc| acc.data.info.code.as_ref().map(|c| c.original_bytes()))
+            } else {
+                Some(known_bytecode)
+            };
 
             if let Some(bytecode) = bytecode {
                 if arb_stylus::is_stylus_runnable(&bytecode) {
@@ -1838,7 +1846,7 @@ where
         Ok(None)
     }
 
-    fn warm_addresses(&self) -> Box<impl Iterator<Item = Address>> {
+    fn warm_addresses(&self) -> &AddressSet {
         <PrecompilesMap as PrecompileProvider<
             revm::Context<BlockEnv, TxEnv, CfgEnv, DB, revm::Journal<DB>, Chain>,
         >>::warm_addresses(&self.inner)
@@ -1873,6 +1881,9 @@ struct CreateFrameCtx {
 pub struct ArbEvm<DB: Database, I> {
     inner: InnerRevmEvm<DB, I>,
     inspect: bool,
+    /// Multi-gas needs step hooks only for opcodes with a non-computation
+    /// dimension. The ordinary computation remainder is filled after the tx.
+    sparse_multigas_inspection: bool,
     create_ctx_stack: Vec<CreateFrameCtx>,
     actor_stack: Vec<Option<Address>>,
 }
@@ -1885,6 +1896,7 @@ where
         Self {
             inner,
             inspect,
+            sparse_multigas_inspection: false,
             create_ctx_stack: Vec::new(),
             actor_stack: Vec::new(),
         }
@@ -1904,6 +1916,10 @@ where
 
     pub fn precompiles_mut(&mut self) -> &mut ArbPrecompilesMap {
         &mut self.inner.precompiles
+    }
+
+    fn enable_sparse_multigas_inspection(&mut self) {
+        self.sparse_multigas_inspection = true;
     }
 }
 
@@ -2034,6 +2050,7 @@ where
                         memory_offset: inputs.return_memory_offset.clone(),
                         was_precompile_called: false,
                         precompile_call_logs: Vec::new(),
+                        charged_new_account_state_gas: inputs.charged_new_account_state_gas,
                     })));
                 }
                 let checkpoint = self.inner.ctx.journal_mut().checkpoint();
@@ -2186,11 +2203,80 @@ where
 
 // ── InspectorEvmTr for ArbEvm ────────────────────────────────────
 
+/// Opcodes whose gas contains a non-computation resource dimension in ArbOS
+/// 60+. Every other opcode can run through revm's plain loop; the executor
+/// fills its aggregate gas into the computation remainder after the tx.
+#[inline]
+fn needs_multigas_step(op: u8) -> bool {
+    matches!(
+        op,
+        opcode::SLOAD
+            | opcode::SSTORE
+            | opcode::BALANCE
+            | opcode::EXTCODESIZE
+            | opcode::EXTCODEHASH
+            | opcode::EXTCODECOPY
+            | opcode::CALL
+            | opcode::CALLCODE
+            | opcode::DELEGATECALL
+            | opcode::STATICCALL
+            | opcode::CREATE
+            | opcode::CREATE2
+            | opcode::SELFDESTRUCT
+            | opcode::LOG0..=opcode::LOG4
+    )
+}
+
+/// revm's inspector loop invokes two virtual hooks for every opcode. Multi-gas
+/// only needs those hooks for [`needs_multigas_step`] opcodes, so this loop
+/// preserves exact instruction execution while bypassing the hooks for pure
+/// computation. This path is enabled only for `MultiGasInspector`; arbitrary
+/// RPC/debug inspectors continue to use revm's full inspector loop.
+fn inspect_sparse_multigas_instructions<DB, I>(
+    context: &mut EthEvmContext<DB>,
+    interpreter: &mut Interpreter<EthInterpreter>,
+    inspector: &mut I,
+    instructions: &InstructionTable<EthInterpreter, EthEvmContext<DB>>,
+    gas_table: &GasTable,
+) -> InterpreterAction
+where
+    DB: Database,
+    I: Inspector<EthEvmContext<DB>, EthInterpreter>,
+{
+    loop {
+        if interpreter.bytecode.is_end() {
+            break;
+        }
+
+        let op = interpreter.bytecode.opcode();
+        let inspect = needs_multigas_step(op);
+        if inspect {
+            inspector.step(interpreter, context);
+        }
+
+        if let Err(error) = interpreter.step(instructions, gas_table, context) {
+            if interpreter.bytecode.action().is_none() {
+                interpreter.halt(error);
+            }
+        }
+
+        if inspect {
+            inspector.step_end(interpreter, context);
+        }
+
+        if interpreter.bytecode.is_end() {
+            break;
+        }
+    }
+
+    interpreter.take_next_action()
+}
+
 impl<DB, I> revm::inspector::InspectorEvmTr for ArbEvm<DB, I>
 where
     DB: Database,
     I: Inspector<EthEvmContext<DB>, EthInterpreter>,
-    revm::Journal<DB>: revm::inspector::JournalExt,
+    revm::Journal<DB>: JournalTr<Database = DB> + revm::inspector::JournalExt,
 {
     type Inspector = I;
 
@@ -2224,6 +2310,41 @@ where
             &mut self.inner.inspector,
         )
     }
+
+    #[inline]
+    fn inspect_frame_run(
+        &mut self,
+    ) -> Result<FrameInitOrResult<Self::Frame>, revm::handler::evm::ContextDbError<Self::Context>>
+    {
+        let sparse_multigas_inspection = self.sparse_multigas_inspection;
+        let (ctx, inspector, frame, instructions) = self.ctx_inspector_frame_instructions();
+
+        let next_action = if sparse_multigas_inspection {
+            inspect_sparse_multigas_instructions(
+                ctx,
+                &mut frame.interpreter,
+                inspector,
+                instructions.instruction_table(),
+                instructions.gas_table(),
+            )
+        } else {
+            revm::inspector::inspect_instructions(
+                ctx,
+                &mut frame.interpreter,
+                inspector,
+                instructions.instruction_table(),
+                instructions.gas_table(),
+            )
+        };
+        let mut result = frame.process_next_action(ctx, next_action);
+
+        if let Ok(ItemOrResult::Result(frame_result)) = &mut result {
+            let (ctx, inspector, frame) = self.ctx_inspector_frame();
+            revm::inspector::handler::frame_end(ctx, inspector, &frame.input, frame_result);
+            frame.set_finished(true);
+        }
+        result
+    }
 }
 
 // ── InspectEvm for ArbEvm ────────────────────────────────────────
@@ -2232,7 +2353,7 @@ impl<DB, I> InspectEvm for ArbEvm<DB, I>
 where
     DB: Database,
     I: Inspector<EthEvmContext<DB>, EthInterpreter>,
-    revm::Journal<DB>: revm::inspector::JournalExt,
+    revm::Journal<DB>: JournalTr<Database = DB> + revm::inspector::JournalExt,
 {
     type Inspector = I;
 
@@ -2252,7 +2373,7 @@ impl<DB, I> Evm for ArbEvm<DB, I>
 where
     DB: Database,
     I: Inspector<EthEvmContext<DB>, EthInterpreter>,
-    revm::Journal<DB>: revm::inspector::JournalExt,
+    revm::Journal<DB>: JournalTr<Database = DB> + revm::inspector::JournalExt,
 {
     type DB = DB;
     type Tx = ArbTransaction;
@@ -2265,6 +2386,10 @@ where
 
     fn block(&self) -> &revm::context::BlockEnv {
         &self.inner.ctx.block
+    }
+
+    fn cfg_env(&self) -> &revm::context::CfgEnv<Self::Spec> {
+        &self.inner.ctx.cfg
     }
 
     fn chain_id(&self) -> u64 {
@@ -2387,6 +2512,21 @@ impl ArbEvmFactory {
         &self.chain_caches
     }
 
+    /// Construct the live block executor's consensus multi-gas EVM. Unlike a
+    /// general debugger inspector, `MultiGasInspector` needs per-instruction
+    /// hooks only for opcodes with a non-computation resource dimension.
+    pub fn create_evm_with_sparse_multigas_inspector<DB: Database>(
+        &self,
+        db: DB,
+        input: EvmEnv<SpecId>,
+        inspector: crate::multi_gas::MultiGasInspector,
+    ) -> ArbEvm<DB, crate::multi_gas::MultiGasInspector> {
+        let eth_evm = self.inner.create_evm_with_inspector(db, input, inspector);
+        let mut evm = build_arb_evm(eth_evm.into_inner(), self.staged(), true);
+        evm.enable_sparse_multigas_inspection();
+        evm
+    }
+
     fn staged(&self) -> Option<std::sync::Arc<arb_context::ArbPrecompileCtx>> {
         self.staged_ctx.read().clone()
     }
@@ -2415,27 +2555,33 @@ fn build_arb_evm<DB: Database, I>(
 
     instruction.insert_instruction(
         BLOBBASEFEE_OPCODE,
-        revm::interpreter::Instruction::new(arb_blob_basefee, 2),
+        revm::interpreter::Instruction::new(arb_blob_basefee),
+        2,
     );
     instruction.insert_instruction(
         SELFDESTRUCT_OPCODE,
-        revm::interpreter::Instruction::new(arb_selfdestruct, 5000),
+        revm::interpreter::Instruction::new(arb_selfdestruct),
+        5000,
     );
     instruction.insert_instruction(
         NUMBER_OPCODE,
-        revm::interpreter::Instruction::new(arb_number, 2),
+        revm::interpreter::Instruction::new(arb_number),
+        2,
     );
     instruction.insert_instruction(
         BLOCKHASH_OPCODE,
-        revm::interpreter::Instruction::new(arb_blockhash, 20),
+        revm::interpreter::Instruction::new(arb_blockhash),
+        20,
     );
     instruction.insert_instruction(
         BALANCE_OPCODE,
-        revm::interpreter::Instruction::new(arb_balance, 0),
+        revm::interpreter::Instruction::new(arb_balance),
+        0,
     );
     instruction.insert_instruction(
         SELFBALANCE_OPCODE,
-        revm::interpreter::Instruction::new(arb_selfbalance, 5),
+        revm::interpreter::Instruction::new(arb_selfbalance),
+        5,
     );
     register_arb_precompiles(&mut precompiles, pre_ctx.clone());
     let arb_precompiles = ArbPrecompilesMap::new(precompiles, pre_ctx);
@@ -2448,7 +2594,7 @@ impl EvmFactory for ArbEvmFactory {
     type Evm<DB: Database, I: Inspector<EthEvmContext<DB>, EthInterpreter>> = ArbEvm<DB, I>;
     type Context<DB: Database> = EthEvmContext<DB>;
     type Tx = ArbTransaction;
-    type Error<DBError: core::error::Error + Send + Sync + 'static> = EVMError<DBError>;
+    type Error<DBError: revm::context::DBErrorMarker> = EVMError<DBError>;
     type HaltReason = HaltReason;
     type Spec = SpecId;
     type Precompiles = PrecompilesMap;

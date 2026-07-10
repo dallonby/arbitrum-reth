@@ -6,7 +6,8 @@ use arb_storage::{
     write_cost, ARBOS_STATE_ADDRESS, STORAGE_READ_GAS, STORAGE_WRITE_GAS, STORAGE_WRITE_ZERO_GAS,
 };
 
-use revm::precompile::{PrecompileId, PrecompileOutput, PrecompileResult};
+use crate::{ArbPrecompileOutput as PrecompileOutput, ArbPrecompileResult as PrecompileResult};
+use revm::precompile::PrecompileId;
 use std::sync::Arc;
 
 use crate::{interfaces::IArbAggregator, ArbPrecompileError};
@@ -29,9 +30,7 @@ const SSTORE_ZERO_GAS: u64 = STORAGE_WRITE_ZERO_GAS;
 const COPY_GAS: u64 = 3;
 
 pub fn create_arbaggregator_precompile(ctx: Arc<ArbPrecompileCtx>) -> DynPrecompile {
-    DynPrecompile::new_stateful(PrecompileId::custom("arbaggregator"), move |input| {
-        handler(input, &ctx)
-    })
+    crate::new_arb_precompile(PrecompileId::custom("arbaggregator"), ctx, handler)
 }
 
 fn handler(mut input: PrecompileInput<'_>, ctx: &ArbPrecompileCtx) -> PrecompileResult {

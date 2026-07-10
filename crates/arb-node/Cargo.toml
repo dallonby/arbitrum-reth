@@ -22,6 +22,9 @@ alloy-genesis = { workspace = true }
 reth-cli = { workspace = true }
 reth-ethereum-cli = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+jsonrpsee = { workspace = true }
 alloy-consensus = { workspace = true }
 alloy-rlp = { workspace = true }
 alloy-eips = { workspace = true }
@@ -49,6 +52,7 @@ reth-node-core = { workspace = true }
 reth-node-events = { workspace = true }
 reth-provider = { workspace = true }
 reth-rpc-eth-api = { workspace = true }
+reth-rpc-server-types = { workspace = true }
 reth-node-ethereum = { workspace = true }
 reth-node-types = { workspace = true }
 reth-payload-builder = { workspace = true }

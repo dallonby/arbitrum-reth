@@ -241,6 +241,7 @@ fn nested_upfront_oog_under_stylus_earns_no_refund() {
         ommers: &[],
         withdrawals: None,
         extra_data: vec![0u8; 32].into(),
+        slot_number: None,
     };
     let mut executor = cfg
         .block_executor_factory()
@@ -262,7 +263,7 @@ fn nested_upfront_oog_under_stylus_earns_no_refund() {
     let r = executor
         .execute_transaction_without_commit(Recovered::new_unchecked(sb, ARBOS_ADDRESS))
         .expect("startblock");
-    executor.commit_transaction(r).expect("commit sb");
+    executor.commit_transaction(r);
 
     // forward(address target, bytes data) with the forwarder as target and
     // empty data: routes the call through the Stylus caller into the forwarder.
@@ -291,8 +292,8 @@ fn nested_upfront_oog_under_stylus_earns_no_refund() {
     let result = executor
         .execute_transaction_without_commit(Recovered::new_unchecked(tx, SENDER))
         .expect("user tx");
-    let gas_used = result.result.result.gas_used();
-    executor.commit_transaction(result).expect("commit user tx");
+    let gas_used = result.result.result.tx_gas_used();
+    executor.commit_transaction(result);
     let _ = executor.finish().expect("finish");
 
     let sender_after = read_balance(harness.state(), SENDER);

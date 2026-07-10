@@ -9,7 +9,7 @@
 
 use alloy_evm::Database;
 use alloy_primitives::{Address, B256, U256};
-use arb_primitives::multigas::MultiGas;
+use arb_primitives::multigas::{MultiGas, ResourceKind};
 use parking_lot::Mutex;
 use revm::{
     bytecode::opcode,
@@ -123,7 +123,7 @@ impl MultiGasInspector {
     }
 
     fn add(&mut self, gas: MultiGas) {
-        self.accumulated = self.accumulated.saturating_add(gas);
+        self.accumulated.saturating_add_into(gas);
     }
 
     /// Records a frame closing. When the outermost frame closes (no frames left
@@ -285,7 +285,15 @@ impl<B, T, C, DB: Database, Ch> Inspector<Ctx<B, T, C, DB, Ch>, EthInterpreter>
                     delta,
                 )
             }
-            Pending::Other => classify(OpKind::Other, delta),
+            // The overwhelming majority of opcodes are pure computation. Avoid
+            // constructing two MultiGas arrays and walking all nine dimensions
+            // for every one of them; this is exactly equivalent to
+            // `classify(OpKind::Other, delta)` followed by `add`.
+            Pending::Other => {
+                self.accumulated
+                    .saturating_increment_into(ResourceKind::Computation, delta);
+                return;
+            }
         };
         self.add(gas);
     }

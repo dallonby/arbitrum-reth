@@ -1,10 +1,11 @@
+use crate::{ArbPrecompileOutput as PrecompileOutput, ArbPrecompileResult as PrecompileResult};
 use alloy_evm::precompiles::{DynPrecompile, PrecompileInput};
 use alloy_primitives::{Address, Log, B256, U256};
 use alloy_sol_types::{SolError, SolEvent, SolInterface};
 use arb_context::ArbPrecompileCtx;
 use arb_storage::ARBOS_STATE_ADDRESS;
 use arbos::programs::{hours_since_arbitrum, hours_to_age, params::StylusParams, Program};
-use revm::precompile::{PrecompileId, PrecompileOutput, PrecompileResult};
+use revm::precompile::PrecompileId;
 use std::sync::Arc;
 
 use crate::{interfaces::IArbWasm, ArbPrecompileError};
@@ -29,9 +30,7 @@ const MIN_CACHED_GAS_UNITS: u64 = 32;
 const COST_SCALAR_PERCENT: u64 = 2;
 
 pub fn create_arbwasm_precompile(ctx: Arc<ArbPrecompileCtx>) -> DynPrecompile {
-    DynPrecompile::new_stateful(PrecompileId::custom("arbwasm"), move |input| {
-        handler(input, &ctx)
-    })
+    crate::new_arb_precompile(PrecompileId::custom("arbwasm"), ctx, handler)
 }
 
 fn handler(mut input: PrecompileInput<'_>, ctx: &ArbPrecompileCtx) -> PrecompileResult {

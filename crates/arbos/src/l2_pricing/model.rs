@@ -1,7 +1,6 @@
 use alloy_primitives::U256;
 use arb_primitives::multigas::{MultiGas, ResourceKind, NUM_RESOURCE_KIND};
 use arb_storage::{StorageBackend, SystemStateBackend};
-use revm::Database;
 
 use arb_chainspec::arbos_version as version;
 
@@ -27,7 +26,7 @@ pub enum BacklogOperation {
 // StorageReadCost (SloadGasEIP2200 = 800) + StorageWriteCost (SstoreSetGasEIP2200 = 20000)
 pub const MULTI_CONSTRAINT_STATIC_BACKLOG_UPDATE_COST: u64 = 20_800;
 
-impl<D: Database> L2PricingState<'_, D> {
+impl<D> L2PricingState<'_, D> {
     /// Determine which gas model to use based on ArbOS version and stored constraints.
     pub fn gas_model_to_use<B: SystemStateBackend>(
         &self,
@@ -833,7 +832,8 @@ mod tests {
         }
 
         // Commit empty EVM state for StartBlock (internal tx has no EVM changes)
-        let empty_changes: HashMap<Address, revm::state::Account> = Default::default();
+        let empty_changes: alloy_primitives::map::AddressMap<revm::state::Account> =
+            Default::default();
         state.commit(empty_changes);
 
         // ================================================================
@@ -878,7 +878,8 @@ mod tests {
         }
 
         // Commit empty EVM state for SubmitRetryable (endTxNow=true, no EVM execution)
-        let empty_changes2: HashMap<Address, revm::state::Account> = Default::default();
+        let empty_changes2: alloy_primitives::map::AddressMap<revm::state::Account> =
+            Default::default();
         state.commit(empty_changes2);
 
         // Clear scratch slots (as done in commit_transaction)
@@ -936,7 +937,8 @@ mod tests {
         // many logs — the regression needed ~11 logs across 7+ contracts to
         // reproduce.
         {
-            let mut evm_changes: HashMap<Address, revm::state::Account> = Default::default();
+            let mut evm_changes: alloy_primitives::map::AddressMap<revm::state::Account> =
+                Default::default();
 
             // Sender account
             let sender = address!("fd86e9a33fd52e4085fb94d24b759448a621cd36");
@@ -967,8 +969,10 @@ mod tests {
                 // Add some storage changes to simulate real contract execution
                 for j in 0u64..3 {
                     let slot = U256::from(j);
-                    let mut evm_slot =
-                        revm::state::EvmStorageSlot::new(U256::from(i as u64 * 100 + j), 0);
+                    let mut evm_slot = revm::state::EvmStorageSlot::new(
+                        U256::from(i as u64 * 100 + j),
+                        revm::state::TransactionId::ZERO,
+                    );
                     evm_slot.present_value = U256::from(i as u64 * 100 + j + 1);
                     acct.storage.insert(slot, evm_slot);
                 }
@@ -1238,7 +1242,8 @@ mod tests {
 
         // EVM commit that INCLUDES the ArbOS account (the critical difference!)
         {
-            let mut evm_changes: HashMap<Address, revm::state::Account> = Default::default();
+            let mut evm_changes: alloy_primitives::map::AddressMap<revm::state::Account> =
+                Default::default();
 
             // Sender
             let sender = address!("fd86e9a33fd52e4085fb94d24b759448a621cd36");
@@ -1252,21 +1257,19 @@ mod tests {
             // ArbOS account IN the EVM commit — simulates a precompile/SLOAD
             // that caused the EVM to track the ArbOS account
             let _ = state.load_cache_account(arbos);
-            let mut arbos_acct = revm::state::Account {
-                info: revm::state::AccountInfo {
-                    nonce: 1,
-                    balance: U256::ZERO,
-                    code_hash: keccak256([]),
-                    code: None,
-                    account_id: None,
-                },
-                ..Default::default()
+            let mut arbos_acct = revm::state::Account::default();
+            arbos_acct.info = revm::state::AccountInfo {
+                nonce: 1,
+                balance: U256::ZERO,
+                code_hash: keccak256([]),
+                code: None,
+                account_id: None,
             };
             // The EVM "read" the scratch slot — it appears in the EVM's storage
             // with is_changed=false (just loaded, not modified)
             arbos_acct.storage.insert(
                 scratch_1,
-                revm::state::EvmStorageSlot::new(U256::from(99), 0),
+                revm::state::EvmStorageSlot::new(U256::from(99), revm::state::TransactionId::ZERO),
             );
             arbos_acct.mark_touch();
             evm_changes.insert(arbos, arbos_acct);
@@ -1505,7 +1508,8 @@ mod tests {
                 // ArbOS not in bundle — add it from cache
                 if let Some(cached_acc) = state.cache.accounts.get(&arbos) {
                     if let Some(ref plain) = cached_acc.account {
-                        let mut storage_changes: HashMap<U256, StorageSlot> = HashMap::default();
+                        let mut storage_changes: alloy_primitives::map::U256Map<StorageSlot> =
+                            Default::default();
                         for (key, value) in &plain.storage {
                             let original =
                                 state.database.storage(arbos, *key).unwrap_or(U256::ZERO);
@@ -1618,7 +1622,7 @@ mod tests {
             );
 
             // Step 5: EVM commit with empty HashMap
-            let empty_state: alloy_primitives::map::HashMap<Address, revm::state::Account> =
+            let empty_state: alloy_primitives::map::AddressMap<revm::state::Account> =
                 Default::default();
             state.commit(empty_state);
 
@@ -1691,7 +1695,7 @@ mod tests {
                     }
                 } else {
                     // Account not in bundle — add if changed
-                    let storage_changes: alloy_primitives::map::HashMap<U256, StorageSlot> =
+                    let storage_changes: alloy_primitives::map::U256Map<StorageSlot> =
                         current_storage
                             .iter()
                             .filter_map(|(key, value)| {
@@ -1785,19 +1789,17 @@ mod tests {
             // reads ArbOS state — the account appears in the EVM output with
             // is_touched=true but storage unchanged.
             let _ = state.load_cache_account(ARBOS_STATE_ADDRESS);
-            let mut arbos_evm_account = revm::state::Account {
-                info: revm::state::AccountInfo {
-                    balance: U256::ZERO,
-                    nonce: 1,
-                    code_hash: keccak256([]),
-                    code: None,
-                    account_id: None,
-                },
-                ..Default::default()
+            let mut arbos_evm_account = revm::state::Account::default();
+            arbos_evm_account.info = revm::state::AccountInfo {
+                balance: U256::ZERO,
+                nonce: 1,
+                code_hash: keccak256([]),
+                code: None,
+                account_id: None,
             };
             arbos_evm_account.mark_touch();
             // No storage entries — EVM read slots but didn't write them
-            let mut evm_changes: alloy_primitives::map::HashMap<Address, revm::state::Account> =
+            let mut evm_changes: alloy_primitives::map::AddressMap<revm::state::Account> =
                 Default::default();
             evm_changes.insert(ARBOS_STATE_ADDRESS, arbos_evm_account);
             state.commit(evm_changes);
@@ -1921,15 +1923,13 @@ mod tests {
             // EVM commit with ArbOS account touched AND a storage slot that was
             // read but not written (EvmStorageSlot with original_value == present_value).
             let _ = state.load_cache_account(ARBOS_STATE_ADDRESS);
-            let mut arbos_evm_account = revm::state::Account {
-                info: revm::state::AccountInfo {
-                    balance: U256::ZERO,
-                    nonce: 1,
-                    code_hash: keccak256([]),
-                    code: None,
-                    account_id: None,
-                },
-                ..Default::default()
+            let mut arbos_evm_account = revm::state::Account::default();
+            arbos_evm_account.info = revm::state::AccountInfo {
+                balance: U256::ZERO,
+                nonce: 1,
+                code_hash: keccak256([]),
+                code: None,
+                account_id: None,
             };
             arbos_evm_account.mark_touch();
 
@@ -1937,11 +1937,14 @@ mod tests {
             // This is what happens when the EVM loads a storage slot via SLOAD
             arbos_evm_account.storage.insert(
                 gas_backlog_slot,
-                revm::state::EvmStorageSlot::new(U256::from(552756u64), 0),
+                revm::state::EvmStorageSlot::new(
+                    U256::from(552756u64),
+                    revm::state::TransactionId::ZERO,
+                ),
                 // new() sets original_value = present_value, so is_changed() = false
             );
 
-            let mut evm_changes: alloy_primitives::map::HashMap<Address, revm::state::Account> =
+            let mut evm_changes: alloy_primitives::map::AddressMap<revm::state::Account> =
                 Default::default();
             evm_changes.insert(ARBOS_STATE_ADDRESS, arbos_evm_account);
             state.commit(evm_changes);
@@ -2064,7 +2067,7 @@ mod tests {
             let _ = state.load_cache_account(sender);
             let _ = state.load_cache_account(receiver);
 
-            let mut user_changes: alloy_primitives::map::HashMap<Address, revm::state::Account> =
+            let mut user_changes: alloy_primitives::map::AddressMap<revm::state::Account> =
                 Default::default();
             let mut sender_acct = revm::state::Account::default();
             sender_acct.info.balance = U256::from(999_000u64);
@@ -2137,7 +2140,7 @@ mod tests {
                         }
                     }
                 } else {
-                    let storage_changes: alloy_primitives::map::HashMap<U256, StorageSlot> =
+                    let storage_changes: alloy_primitives::map::U256Map<StorageSlot> =
                         current_storage
                             .iter()
                             .filter_map(|(key, value)| {
@@ -2277,7 +2280,7 @@ mod tests {
             // EVM commit: empty (StartBlock internal tx)
             {
                 use revm::DatabaseCommit;
-                let empty: alloy_primitives::map::HashMap<Address, revm::state::Account> =
+                let empty: alloy_primitives::map::AddressMap<revm::state::Account> =
                     Default::default();
                 state.commit(empty);
             }
@@ -2287,10 +2290,8 @@ mod tests {
                 use revm::DatabaseCommit;
                 let sender = address!("1111111111111111111111111111111111111111");
                 let _ = state.load_cache_account(sender);
-                let mut user_changes: alloy_primitives::map::HashMap<
-                    Address,
-                    revm::state::Account,
-                > = Default::default();
+                let mut user_changes: alloy_primitives::map::AddressMap<revm::state::Account> =
+                    Default::default();
                 let mut sender_acct = revm::state::Account::default();
                 sender_acct.info.balance = U256::from(999_000u64);
                 sender_acct.info.nonce = 1;
@@ -2363,7 +2364,7 @@ mod tests {
                     }
                 } else {
                     // Account not in bundle
-                    let storage_changes: alloy_primitives::map::HashMap<U256, StorageSlot> =
+                    let storage_changes: alloy_primitives::map::U256Map<StorageSlot> =
                         current_storage
                             .iter()
                             .filter_map(|(key, value)| {

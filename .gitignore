@@ -1,6 +1,9 @@
 # Build
 /target/
 **/target/
+/target-reth23-native/
+/target-reth23-revm41-native/
+/target-reth23/
 
 # IDE
 .idea/

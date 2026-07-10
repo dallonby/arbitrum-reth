@@ -13,7 +13,7 @@ use alloy_primitives::{keccak256, Address, Bytes, Signature, TxHash, TxKind, B25
 use alloy_rlp::{Decodable, Encodable};
 use reth_primitives_traits::{
     crypto::secp256k1::{recover_signer, recover_signer_unchecked},
-    InMemorySize, SignedTransaction,
+    InMemorySize,
 };
 
 use arb_alloy_consensus::tx::{
@@ -188,6 +188,12 @@ impl ArbTransactionSigned {
         &self.signature
     }
 
+    /// Return the canonical transaction hash without requiring every
+    /// downstream consumer to import Alloy's [`TxHashRef`] extension trait.
+    pub fn tx_hash(&self) -> &TxHash {
+        TxHashRef::tx_hash(self)
+    }
+
     /// Returns the inner typed transaction.
     pub fn inner(&self) -> &ArbTypedTransaction {
         &self.transaction
@@ -241,6 +247,25 @@ impl ArbTransactionSigned {
     }
 }
 
+impl<T: alloy_eips::eip7594::Encodable7594>
+    From<
+        alloy_consensus::Signed<
+            alloy_consensus::EthereumTypedTransaction<alloy_consensus::TxEip4844Variant<T>>,
+        >,
+    > for ArbTransactionSigned
+{
+    fn from(
+        signed: alloy_consensus::Signed<
+            alloy_consensus::EthereumTypedTransaction<alloy_consensus::TxEip4844Variant<T>>,
+        >,
+    ) -> Self {
+        let envelope: alloy_consensus::EthereumTxEnvelope<
+            alloy_consensus::TxEip4844Variant<T>,
+        > = signed.into();
+        Self::from_envelope(envelope.into())
+    }
+}
+
 #[inline]
 fn pack_poster_units(level: u64, units: u64) -> u64 {
     ((level & 0xFF) << 56) | (units & 0x00FF_FFFF_FFFF_FFFF)
@@ -282,16 +307,6 @@ impl InMemorySize for ArbTransactionSigned {
 impl TxHashRef for ArbTransactionSigned {
     fn tx_hash(&self) -> &TxHash {
         self.hash.get_or_init(|| self.compute_hash())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SignedTransaction
-// ---------------------------------------------------------------------------
-
-impl SignedTransaction for ArbTransactionSigned {
-    fn recalculate_hash(&self) -> B256 {
-        keccak256(self.encoded_2718())
     }
 }
 
@@ -862,12 +877,6 @@ impl<'de> serde::Deserialize<'de> for ArbTransactionSigned {
 }
 
 // ---------------------------------------------------------------------------
-// RlpBincode — required by SerdeBincodeCompat
-// ---------------------------------------------------------------------------
-
-impl reth_primitives_traits::serde_bincode_compat::RlpBincode for ArbTransactionSigned {}
-
-// ---------------------------------------------------------------------------
 // Compact — required by MaybeCompact when reth-codec feature is active
 // ---------------------------------------------------------------------------
 
@@ -925,7 +934,7 @@ impl reth_db_api::table::Compress for ArbTransactionSigned {
 }
 
 impl reth_db_api::table::Decompress for ArbTransactionSigned {
-    fn decompress(value: &[u8]) -> Result<Self, reth_db_api::DatabaseError> {
+    fn decompress(value: &[u8]) -> Result<Self, reth_codecs::DecompressError> {
         let (obj, _) = reth_codecs::Compact::from_compact(value, value.len());
         Ok(obj)
     }

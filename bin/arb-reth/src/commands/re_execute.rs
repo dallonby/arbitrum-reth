@@ -24,9 +24,10 @@ use reth_evm::{block::BlockExecutor, execute::BlockExecutionError, ConfigureEvm}
 use reth_primitives_traits::{format_gas_throughput, BlockBody, GotExpected};
 use reth_provider::{
     BlockNumReader, BlockReader, ChainSpecProvider, DatabaseProviderFactory, HeaderProvider,
-    ReceiptProvider, TransactionVariant,
+    ReceiptProvider, StateRootProvider, TransactionVariant,
 };
 use reth_revm::database::StateProviderDatabase;
+use reth_trie_common::HashedPostState;
 use revm_database::{states::bundle_state::BundleRetention, State};
 use std::{
     sync::{
@@ -59,12 +60,23 @@ pub struct Command<C: ChainSpecParser> {
     num_tasks: Option<u64>,
 
     /// Number of blocks each worker processes before grabbing the next chunk.
-    #[arg(long, default_value = "5000")]
+    #[arg(
+        long,
+        default_value = "5000",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     blocks_per_chunk: u64,
 
     /// Continues with execution when an invalid block is encountered and collects these blocks.
     #[arg(long)]
     skip_invalid_blocks: bool,
+
+    /// Recompute and compare the exact post-state root after every replayed block.
+    ///
+    /// This is substantially more expensive than receipt-only replay and is intended
+    /// for ad-hoc state-equivalence diagnostics.
+    #[arg(long)]
+    verify_state_root: bool,
 }
 
 impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>> Command<C> {
@@ -97,6 +109,10 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
                 max_block = to;
             }
         };
+        eyre::ensure!(
+            min_block <= max_block,
+            "--from ({min_block}) is above --to / chain head ({max_block})"
+        );
 
         let num_tasks = self.num_tasks.unwrap_or_else(|| {
             std::thread::available_parallelism()
@@ -125,6 +141,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
         };
 
         let skip_invalid_blocks = self.skip_invalid_blocks;
+        let verify_state_root = self.verify_state_root;
         let blocks_per_chunk = self.blocks_per_chunk;
         let (stats_tx, mut stats_rx) = mpsc::unbounded_channel();
         let (info_tx, mut info_rx) = mpsc::unbounded_channel();
@@ -152,17 +169,22 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
 
                     // Atomically grab the next chunk of blocks.
                     let chunk_start = next_block.fetch_add(blocks_per_chunk, Ordering::Relaxed);
-                    if chunk_start >= max_block {
+                    if chunk_start > max_block {
                         break;
                     }
-                    let chunk_end = (chunk_start + blocks_per_chunk).min(max_block);
+                    let chunk_end = chunk_start
+                        .saturating_add(blocks_per_chunk - 1)
+                        .min(max_block);
 
                     let mut state = State::builder()
                         .with_database(db_at(chunk_start - 1))
                         .with_bundle_update()
                         .build();
+                    let root_provider = verify_state_root
+                        .then(|| provider_factory.history_by_block_number(chunk_start - 1))
+                        .transpose()?;
 
-                    'blocks: for block in chunk_start..chunk_end {
+                    'blocks: for block in chunk_start..=chunk_end {
                         if cancellation.is_cancelled() {
                             break;
                         }
@@ -188,8 +210,30 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
                         };
                         state.merge_transitions(BundleRetention::PlainState);
 
+                        if let Some(root_provider) = root_provider.as_ref() {
+                            let hashed_state = HashedPostState::from_bundle_state::<
+                                reth_trie_common::KeccakKeyHasher,
+                            >(state.bundle_state.state());
+                            let got = root_provider.state_root(hashed_state)?;
+                            let expected = block.state_root();
+                            if got != expected {
+                                let err = eyre::eyre!(
+                                    "State root mismatch at block {} {}: got {}, expected {}",
+                                    block.number(),
+                                    block.hash(),
+                                    got,
+                                    expected
+                                );
+                                if skip_invalid_blocks {
+                                    let _ = info_tx.send((block, err));
+                                    break 'blocks;
+                                }
+                                return Err(err);
+                            }
+                        }
+
                         if let Err(err) = consensus
-                            .validate_block_post_execution(&block, &result, None)
+                            .validate_block_post_execution(&block, &result, None, None)
                             .wrap_err_with(|| {
                                 format!(
                                     "Failed to validate block {} {}",

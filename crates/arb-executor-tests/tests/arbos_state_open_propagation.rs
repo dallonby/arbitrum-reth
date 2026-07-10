@@ -46,7 +46,11 @@ impl Database for FailingDb {
     type Error = FakeDbError;
 
     fn basic(&mut self, _address: Address) -> Result<Option<revm_state::AccountInfo>, Self::Error> {
-        Ok(None)
+        // The ArbOS account exists in every initialized chain. Returning an
+        // account here ensures StateDB must consult backing storage for its
+        // version slot instead of correctly short-circuiting an absent account
+        // to zero.
+        Ok(Some(revm_state::AccountInfo::default()))
     }
 
     fn code_by_hash(&mut self, _code_hash: B256) -> Result<revm_state::Bytecode, Self::Error> {
@@ -54,7 +58,10 @@ impl Database for FailingDb {
     }
 
     fn storage(&mut self, _address: Address, _index: U256) -> Result<U256, Self::Error> {
-        if self.armed.replace(false) {
+        // Reth 2.3 may perform a pre-block storage read before ArbOS opens.
+        // Keep the fault armed so the test still targets propagation rather
+        // than whichever component happens to issue the first read.
+        if self.armed.get() {
             return Err(FakeDbError("synthetic db read failure"));
         }
         Ok(U256::ZERO)
@@ -103,6 +110,7 @@ fn apply_pre_execution_propagates_db_failure() {
         ommers: &[],
         withdrawals: None,
         extra_data: extra.into(),
+        slot_number: None,
     };
 
     let mut executor = cfg

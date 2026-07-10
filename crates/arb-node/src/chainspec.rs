@@ -18,6 +18,14 @@ use arbos::arbos_types::ParsedInitMessage;
 
 use crate::genesis;
 
+/// Robinhood mainnet's Nitro/ArbOS genesis specification.
+///
+/// Keeping the production spec in the supporting arb-reth crate lets
+/// downstream executors use the exact same bytes as the node without relying
+/// on a sibling checkout or a separately mounted file.
+pub const ROBINHOOD_MAINNET_CHAIN_SPEC_JSON: &str =
+    include_str!("../../../genesis/robinhood-mainnet.json");
+
 /// Block gas limit at genesis (`l2pricing.GethBlockGasLimit = 1 << 50`).
 const NITRO_GENESIS_GAS_LIMIT: u64 = 1 << 50;
 /// Initial L2 base fee in wei at genesis (0.1 gwei).
@@ -31,6 +39,16 @@ const DEFAULT_INITIAL_L1_BASE_FEE_WEI: u64 = 50_000_000_000;
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct ArbChainSpecParser;
+
+impl ArbChainSpecParser {
+    /// Parse an Arbitrum chain spec without requiring downstream consumers to
+    /// depend on Reth's CLI crate solely to bring [`ChainSpecParser`] into
+    /// scope. This is the same parser used by the arb-reth CLI and preserves
+    /// the ArbOS genesis-state injection performed below.
+    pub fn parse(s: &str) -> eyre::Result<Arc<ChainSpec>> {
+        <Self as ChainSpecParser>::parse(s)
+    }
+}
 
 impl ChainSpecParser for ArbChainSpecParser {
     type ChainSpec = ChainSpec;
@@ -773,6 +791,13 @@ fn pad_address_lower(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn embedded_robinhood_mainnet_spec_parses_with_expected_chain_id() {
+        let spec = ArbChainSpecParser::parse(ROBINHOOD_MAINNET_CHAIN_SPEC_JSON)
+            .expect("embedded Robinhood mainnet chain spec must parse");
+        assert_eq!(spec.chain.id(), 4663);
+    }
 
     #[test]
     fn serialize_chain_config_matches_v10_default_layout() {

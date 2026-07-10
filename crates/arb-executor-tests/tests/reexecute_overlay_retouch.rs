@@ -54,10 +54,12 @@ fn deposit_block(l2_block: u64, parent_hash: B256) -> Block<ArbTransactionSigned
         nonce: B64::from(1u64.to_be_bytes()),
         base_fee_per_gas: Some(0x1315410),
         extra_data: Bytes::from(vec![0u8; 32]),
+        slot_number: None,
         parent_beacon_block_root: None,
         blob_gas_used: None,
         excess_blob_gas: None,
         requests_hash: None,
+        block_access_list_hash: None,
     };
     let tx = ArbTransactionSigned::new_unhashed(
         ArbTypedTransaction::Deposit(ArbDepositTx {

@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap};
 
 use alloy_primitives::Address;
 use revm::{database::State, Database};
 use revm_database::{AccountStatus as CacheAccountStatus, TransitionAccount};
-use revm_state::AccountInfo;
+use revm_state::{AccountInfo, EvmStorage};
 
 #[derive(Clone, Debug)]
 struct Entry {
@@ -66,7 +66,10 @@ impl StateOverlay {
         }
         let entries: Vec<(Address, Entry)> = self.entries.drain().collect();
 
-        let mut existing_transitions: Vec<(Address, TransitionAccount)> = Vec::new();
+        let mut existing_transitions: Vec<(
+            Address,
+            TransitionAccount<Option<Cow<'static, EvmStorage>>>,
+        )> = Vec::new();
 
         for (addr, entry) in entries {
             let current_info = state
@@ -110,7 +113,7 @@ impl StateOverlay {
                             status: CacheAccountStatus::InMemoryChange,
                             previous_info: entry.previous_info,
                             previous_status,
-                            storage: Default::default(),
+                            storage: None,
                             storage_was_destroyed: false,
                         },
                     ));
@@ -161,7 +164,7 @@ impl StateOverlay {
                         status: CacheAccountStatus::InMemoryChange,
                         previous_info: entry.previous_info,
                         previous_status: entry.previous_status,
-                        storage: Default::default(),
+                        storage: None,
                         storage_was_destroyed: false,
                     },
                 ));
@@ -215,7 +218,7 @@ impl StateOverlay {
                     status: new_status,
                     previous_info: entry.previous_info,
                     previous_status: entry.previous_status,
-                    storage: Default::default(),
+                    storage: None,
                     storage_was_destroyed,
                 },
             ));

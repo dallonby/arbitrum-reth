@@ -107,6 +107,7 @@ fn auto_redeem_redeemer_is_coinbase_changeset_baseline() {
         ommers: &[],
         withdrawals: None,
         extra_data: vec![0u8; 32].into(),
+        slot_number: None,
     };
     let mut executor = cfg
         .block_executor_factory()
@@ -125,9 +126,7 @@ fn auto_redeem_redeemer_is_coinbase_changeset_baseline() {
         submit_res.result.result.is_success(),
         "submit should succeed"
     );
-    executor
-        .commit_transaction(submit_res)
-        .expect("submit commit");
+    executor.commit_transaction(submit_res);
 
     let scheduled = executor.drain_scheduled_txs();
     assert_eq!(scheduled.len(), 1, "submit should schedule one auto-redeem");
@@ -139,9 +138,7 @@ fn auto_redeem_redeemer_is_coinbase_changeset_baseline() {
         redeem_res.result.result.is_success(),
         "redeem should succeed"
     );
-    executor
-        .commit_transaction(redeem_res)
-        .expect("redeem commit");
+    executor.commit_transaction(redeem_res);
 
     let _ = executor.finish().expect("finish");
 

@@ -209,6 +209,7 @@ fn rectify_chain_owner_matches_canonical() {
         ommers: &[],
         withdrawals: None,
         extra_data: vec![0u8; 32].into(),
+        slot_number: None,
     };
     let mut executor = cfg
         .block_executor_factory()
@@ -239,9 +240,7 @@ fn rectify_chain_owner_matches_canonical() {
     let internal_result = executor
         .execute_transaction_without_commit(internal_recovered)
         .expect("execute internal tx");
-    executor
-        .commit_transaction(internal_result)
-        .expect("commit internal tx");
+    executor.commit_transaction(internal_result);
 
     let tx = build_tx();
     let recovered: Recovered<ArbTransactionSigned> = arb_executor_tests::helpers::recover(tx);
@@ -257,8 +256,8 @@ fn rectify_chain_owner_matches_canonical() {
 
     let logs = result.result.result.logs().to_vec();
     let status = result.result.result.is_success();
-    let gas_used = result.result.result.gas_used();
-    executor.commit_transaction(result).expect("commit");
+    let gas_used = result.result.result.tx_gas_used();
+    executor.commit_transaction(result);
     let _ = executor.finish().expect("finish");
 
     let size = read_slot(

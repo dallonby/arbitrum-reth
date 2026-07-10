@@ -1,7 +1,7 @@
 use alloy_primitives::{address, keccak256, Address, Bytes, U256};
 use arb_storage_errors::{DatabaseError, DatabaseErrorInfo, StorageError};
 use revm::Database;
-use std::collections::HashMap;
+use std::borrow::Cow;
 
 fn db_read_error<E: core::fmt::Display>(err: E) -> StorageError {
     DatabaseError::Read(DatabaseErrorInfo::new(err.to_string())).into()
@@ -79,7 +79,7 @@ pub fn write_storage_at<D: Database>(
     slot: U256,
     value: U256,
 ) -> Result<(), StorageError> {
-    use revm_database::states::StorageSlot;
+    use revm::state::{EvmStorage, EvmStorageSlot, TransactionId};
 
     ensure_cache_account(state, account);
 
@@ -147,15 +147,18 @@ pub fn write_storage_at<D: Database>(
             "write_storage_at applying transition"
         );
     }
-    let mut storage_changes: revm_database::StorageWithOriginalValues = HashMap::default();
-    storage_changes.insert(slot, StorageSlot::new_changed(original_value, value));
+    let mut storage_changes = EvmStorage::default();
+    storage_changes.insert(
+        slot,
+        EvmStorageSlot::new_changed(original_value, value, TransactionId::ZERO),
+    );
 
     let transition = revm::database::TransitionAccount {
         info,
         status: current_status,
         previous_info,
         previous_status,
-        storage: storage_changes,
+        storage: Some(Cow::Owned(storage_changes)),
         storage_was_destroyed: false,
     };
 
@@ -219,7 +222,7 @@ pub fn set_account_nonce<D: Database>(
         status: current_status,
         previous_info,
         previous_status,
-        storage: HashMap::default(),
+        storage: None,
         storage_was_destroyed: false,
     };
     state.apply_transition(vec![(addr, transition)]);
@@ -266,7 +269,7 @@ pub fn set_account_code<D: Database>(
         status: current_status,
         previous_info,
         previous_status,
-        storage: HashMap::default(),
+        storage: None,
         storage_was_destroyed: false,
     };
     state.apply_transition(vec![(addr, transition)]);
@@ -435,13 +438,13 @@ mod tests {
 
         // Step 2: EVM commit for internal tx (empty state).
         use revm_database::DatabaseCommit;
-        let empty_state: alloy_primitives::map::HashMap<Address, revm_state::Account> =
+        let empty_state: alloy_primitives::map::AddressMap<revm_state::Account> =
             Default::default();
         state.commit(empty_state);
 
         // Step 3: EVM commit for user tx (modifies a different account).
         let sender = address!("1111111111111111111111111111111111111111");
-        let mut user_changes: alloy_primitives::map::HashMap<Address, revm_state::Account> =
+        let mut user_changes: alloy_primitives::map::AddressMap<revm_state::Account> =
             Default::default();
         // Load sender into cache first so commit doesn't panic.
         let _ = state.load_cache_account(sender);

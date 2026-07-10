@@ -12,13 +12,13 @@ use arbos::{
         StylusParams, COST_SCALAR_PERCENT, MIN_CACHED_GAS_UNITS, MIN_INIT_GAS_UNITS,
     },
 };
-use revm::{
-    precompile::{PrecompileId, PrecompileOutput, PrecompileResult},
-    primitives::Log,
-};
+use revm::{precompile::PrecompileId, primitives::Log};
 use std::sync::Arc;
 
-use crate::{interfaces::IArbOwner, ArbPrecompileError};
+use crate::{
+    interfaces::IArbOwner, ArbPrecompileError, ArbPrecompileOutput as PrecompileOutput,
+    ArbPrecompileResult as PrecompileResult,
+};
 
 /// ArbOwner precompile address (0x70).
 pub const ARBOWNER_ADDRESS: Address = Address::new([
@@ -38,9 +38,7 @@ const COPY_GAS: u64 = 3;
 const WARM_SLOAD_GAS: u64 = 100;
 
 pub fn create_arbowner_precompile(ctx: Arc<ArbPrecompileCtx>) -> DynPrecompile {
-    DynPrecompile::new_stateful(PrecompileId::custom("arbowner"), move |input| {
-        handler(input, &ctx)
-    })
+    crate::new_arb_precompile(PrecompileId::custom("arbowner"), ctx, handler)
 }
 
 fn handler(mut input: PrecompileInput<'_>, ctx: &ArbPrecompileCtx) -> PrecompileResult {
@@ -538,7 +536,7 @@ fn handler(mut input: PrecompileInput<'_>, ctx: &ArbPrecompileCtx) -> Precompile
 
     let result = match result {
         Ok(output) => {
-            if output.reverted {
+            if output.is_revert() {
                 Ok(PrecompileOutput::new_reverted(0, output.bytes))
             } else {
                 let arbos_version = ctx.block.arbos_version;

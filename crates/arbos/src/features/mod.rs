@@ -14,6 +14,15 @@ pub struct Features<'a, D> {
     _phantom: PhantomData<&'a mut revm::database::State<D>>,
 }
 
+// `Features` contains only a storage-key descriptor. The phantom state borrow
+// carries the same lifetime/backend relationship as `Storage`, but there is no
+// state pointer to dereference or mutable data to share. Revm 40's `State`
+// contains a `Send`-only commit hook, so deriving these auto traits through the
+// phantom would make detached, immutable ArbOS descriptors unnecessarily
+// non-`Sync`.
+unsafe impl<D: Send> Send for Features<'_, D> {}
+unsafe impl<D: Sync> Sync for Features<'_, D> {}
+
 pub fn open_features<'a, D>(base_key: alloy_primitives::B256, offset: u64) -> Features<'a, D> {
     Features {
         features: StorageBackedBigUint::new(base_key, offset),

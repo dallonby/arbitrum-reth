@@ -39,10 +39,12 @@ fn provisional_header() -> Header {
         difficulty: U256::from(1),
         gas_used: 0,
         extra_data: Default::default(),
+        slot_number: None,
         parent_beacon_block_root: None,
         blob_gas_used: None,
         excess_blob_gas: None,
         requests_hash: None,
+        block_access_list_hash: None,
     }
 }
 
@@ -94,6 +96,7 @@ fn arb_executor_constructs_via_factory() {
         ommers: &[],
         withdrawals: None,
         extra_data: extra.into(),
+        slot_number: None,
     };
     let _executor = cfg
         .block_executor_factory()
@@ -150,6 +153,7 @@ fn arb_executor_apply_pre_execution_on_harness_state() {
         ommers: &[],
         withdrawals: None,
         extra_data: extra.into(),
+        slot_number: None,
     };
 
     let mut executor = cfg

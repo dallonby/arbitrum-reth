@@ -8,7 +8,6 @@ pub use error::ProgramsError;
 
 use alloy_primitives::{B256, U256};
 use arb_primitives::multigas::{MultiGas, ResourceKind};
-use revm::Database;
 
 use arb_storage::{Storage, StorageBackedUint64, StorageBackend, SystemStateBackend};
 
@@ -273,7 +272,7 @@ impl<D> Programs<'_, D> {
     }
 }
 
-impl<D: Database> Programs<'_, D> {
+impl<D> Programs<'_, D> {
     pub fn initialize<B: StorageBackend>(
         arbos_version: u64,
         sto: &Storage<'_, D>,

@@ -224,6 +224,7 @@ fn run() -> (u64, bool, usize) {
         ommers: &[],
         withdrawals: None,
         extra_data: vec![0u8; 32].into(),
+        slot_number: None,
     };
     let mut executor = cfg
         .block_executor_factory()
@@ -240,7 +241,7 @@ fn run() -> (u64, bool, usize) {
         .execute_transaction_without_commit(recovered)
         .expect("execute tx");
 
-    let gas_used = exec_result.result.result.gas_used();
+    let gas_used = exec_result.result.result.tx_gas_used();
     let success = exec_result.result.result.is_success();
     let logs = exec_result.result.result.logs().len();
     (gas_used, success, logs)

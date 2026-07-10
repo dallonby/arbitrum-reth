@@ -136,6 +136,7 @@ fn arb_executor_executes_signed_legacy_transfer() {
         ommers: &[],
         withdrawals: None,
         extra_data: extra.into(),
+        slot_number: None,
     };
 
     let mut executor = cfg
@@ -160,7 +161,7 @@ fn arb_executor_executes_signed_legacy_transfer() {
     let result = executor
         .execute_transaction_without_commit(recovered)
         .expect("tx execution");
-    let _ = executor.commit_transaction(result).expect("commit");
+    let _ = executor.commit_transaction(result);
     let _ = executor.finish().expect("finish");
 
     let recipient_balance = h

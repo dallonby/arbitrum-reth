@@ -1,8 +1,9 @@
+use crate::{ArbPrecompileOutput as PrecompileOutput, ArbPrecompileResult as PrecompileResult};
 use alloy_evm::precompiles::{DynPrecompile, PrecompileInput};
 use alloy_primitives::{Address, U256};
 use alloy_sol_types::SolInterface;
 use arb_context::ArbPrecompileCtx;
-use revm::precompile::{PrecompileId, PrecompileOutput, PrecompileResult};
+use revm::precompile::PrecompileId;
 use std::sync::Arc;
 
 use crate::interfaces::IArbosTest;
@@ -14,9 +15,7 @@ pub const ARBOSTEST_ADDRESS: Address = Address::new([
 ]);
 
 pub fn create_arbostest_precompile(ctx: Arc<ArbPrecompileCtx>) -> DynPrecompile {
-    DynPrecompile::new_stateful(PrecompileId::custom("arbostest"), move |input| {
-        handler(input, &ctx)
-    })
+    crate::new_arb_precompile(PrecompileId::custom("arbostest"), ctx, handler)
 }
 
 fn handler(input: PrecompileInput<'_>, ctx: &ArbPrecompileCtx) -> PrecompileResult {

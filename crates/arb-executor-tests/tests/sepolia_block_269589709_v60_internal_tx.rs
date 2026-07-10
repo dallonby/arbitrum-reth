@@ -225,6 +225,7 @@ fn v60_internal_tx_start_block_writes_canonical_slots() {
         ommers: &[],
         withdrawals: None,
         extra_data: extra.into(),
+        slot_number: None,
     };
     let mut executor = cfg
         .block_executor_factory()
@@ -243,7 +244,7 @@ fn v60_internal_tx_start_block_writes_canonical_slots() {
     let result = executor
         .execute_transaction_without_commit(recovered)
         .expect("execute internal tx");
-    executor.commit_transaction(result).expect("commit");
+    executor.commit_transaction(result);
     let _ = executor.finish().expect("finish");
 
     let eip2935 = read_slot(

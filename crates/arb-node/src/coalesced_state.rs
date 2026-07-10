@@ -13,8 +13,8 @@ use reth_storage_api::{
     StateRootProvider, StorageRootProvider,
 };
 use reth_trie::{
-    updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof,
-    MultiProofTargets, StorageMultiProof, TrieInput,
+    updates::TrieUpdates, AccountProof, ExecutionWitnessMode, HashedPostState, HashedStorage,
+    MultiProof, MultiProofTargets, StorageMultiProof, TrieInput,
 };
 use revm_database::BundleState;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -193,8 +193,13 @@ impl StateProofProvider for CoalescedStateProvider {
         self.inner.multiproof(input, targets)
     }
 
-    fn witness(&self, input: TrieInput, target: HashedPostState) -> ProviderResult<Vec<Bytes>> {
-        self.inner.witness(input, target)
+    fn witness(
+        &self,
+        input: TrieInput,
+        target: HashedPostState,
+        mode: ExecutionWitnessMode,
+    ) -> ProviderResult<Vec<Bytes>> {
+        self.inner.witness(input, target, mode)
     }
 }
 

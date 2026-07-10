@@ -23,7 +23,7 @@ use reth_payload_builder::PayloadBuilderHandle;
 use reth_primitives_traits::NodePrimitives;
 use reth_provider::{
     providers::{BlockchainProvider, ProviderNodeTypes},
-    ProviderFactory, StorageSettingsCache,
+    ProviderFactory,
 };
 use reth_prune::PrunerWithFactory;
 use reth_stages_api::{MetricEventsSender, Pipeline};
@@ -58,6 +58,7 @@ pub fn build_arb_engine_orchestrator<N, Client, S, V, C>(
     sync_metrics_tx: MetricEventsSender,
     evm_config: C,
     changeset_cache: ChangesetCache,
+    runtime: Runtime,
 ) -> (
     ChainOrchestrator<
         EngineHandler<
@@ -77,8 +78,6 @@ where
     C: ConfigureEvm<Primitives = N::Primitives> + 'static,
 {
     let downloader = BasicBlockDownloader::new(client, consensus.clone());
-    let use_hashed_state = provider.cached_storage_settings().use_hashed_state();
-
     let persistence_handle =
         PersistenceHandle::<N::Primitives>::spawn_service(provider, pruner, sync_metrics_tx);
 
@@ -95,7 +94,7 @@ where
         engine_kind,
         evm_config,
         changeset_cache,
-        use_hashed_state,
+        runtime,
     );
 
     // Clone the tree sender BEFORE it's consumed by the request handler.

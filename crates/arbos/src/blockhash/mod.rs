@@ -1,4 +1,4 @@
-use alloy_primitives::{keccak256, B256};
+use alloy_primitives::{keccak256, B256, U256};
 use revm::Database;
 
 use arb_storage::{Storage, StorageBackedUint64, StorageBackend, SystemStateBackend};
@@ -23,7 +23,7 @@ pub fn open_blockhashes<D>(backing_storage: Storage<'_, D>) -> Blockhashes<'_, D
     }
 }
 
-impl<D: Database> Blockhashes<'_, D> {
+impl<D> Blockhashes<'_, D> {
     pub fn l1_block_number<B: SystemStateBackend>(
         &self,
         backend: &mut B,
@@ -40,8 +40,11 @@ impl<D: Database> Blockhashes<'_, D> {
         if number >= current_number || number + 256 < current_number {
             return Ok(None);
         }
-        let hash = self.backing_storage.get_by_uint64(1 + (number % 256))?;
-        Ok(Some(hash))
+        let slot = self.backing_storage.new_slot(1 + (number % 256));
+        let hash = backend
+            .sload_system(self.backing_storage.account(), slot)
+            .map_err(Into::into)?;
+        Ok(Some(B256::from(hash)))
     }
 
     pub fn record_new_l1_block<B: StorageBackend>(
@@ -74,12 +77,24 @@ impl<D: Database> Blockhashes<'_, D> {
             combined.extend_from_slice(&next_num_buf);
             let fill = keccak256(&combined);
 
-            self.backing_storage
-                .set_by_uint64(1 + (next_number % 256), fill)?;
+            let slot = self.backing_storage.new_slot(1 + (next_number % 256));
+            backend
+                .sstore(
+                    self.backing_storage.account(),
+                    slot,
+                    U256::from_be_bytes(fill.0),
+                )
+                .map_err(Into::into)?;
         }
 
-        self.backing_storage
-            .set_by_uint64(1 + (number % 256), block_hash)?;
+        let slot = self.backing_storage.new_slot(1 + (number % 256));
+        backend
+            .sstore(
+                self.backing_storage.account(),
+                slot,
+                U256::from_be_bytes(block_hash.0),
+            )
+            .map_err(Into::into)?;
         Ok(self.l1_block_number.set(backend, number + 1)?)
     }
 }

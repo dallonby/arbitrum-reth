@@ -132,6 +132,7 @@ fn run_tx(
         ommers: &[],
         withdrawals: None,
         extra_data: vec![0u8; 32].into(),
+        slot_number: None,
     };
     let mut executor = cfg
         .block_executor_factory()
@@ -144,6 +145,6 @@ fn run_tx(
     let result = executor
         .execute_transaction_without_commit(recovered)
         .expect("exec");
-    executor.commit_transaction(result).expect("commit");
+    executor.commit_transaction(result);
     let _ = executor.finish().expect("finish");
 }

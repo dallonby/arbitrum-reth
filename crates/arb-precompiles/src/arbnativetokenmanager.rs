@@ -4,7 +4,8 @@ use alloy_sol_types::{SolEvent, SolInterface};
 use arb_context::ArbPrecompileCtx;
 use arb_storage::ARBOS_STATE_ADDRESS;
 
-use revm::precompile::{PrecompileId, PrecompileOutput, PrecompileResult};
+use crate::{ArbPrecompileOutput as PrecompileOutput, ArbPrecompileResult as PrecompileResult};
+use revm::precompile::PrecompileId;
 use std::sync::Arc;
 
 use crate::{interfaces::IArbNativeTokenManager, ArbPrecompileError};
@@ -24,10 +25,7 @@ const MINT_BURN_GAS: u64 = 100 + 9000;
 const EVENT_GAS: u64 = 375 + 2 * 375 + 8 * 32;
 
 pub fn create_arbnativetokenmanager_precompile(ctx: Arc<ArbPrecompileCtx>) -> DynPrecompile {
-    DynPrecompile::new_stateful(
-        PrecompileId::custom("arbnativetokenmanager"),
-        move |input| handler(input, &ctx),
-    )
+    crate::new_arb_precompile(PrecompileId::custom("arbnativetokenmanager"), ctx, handler)
 }
 
 fn handler(mut input: PrecompileInput<'_>, ctx: &ArbPrecompileCtx) -> PrecompileResult {

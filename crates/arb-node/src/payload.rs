@@ -9,7 +9,7 @@ use reth_node_builder::{
     components::PayloadServiceBuilder, BuilderContext, FullNodeTypes, NodeTypes,
 };
 use reth_payload_builder::{PayloadBuilderHandle, PayloadServiceCommand};
-use reth_payload_primitives::{PayloadBuilderAttributes, PayloadTypes};
+use reth_payload_primitives::PayloadTypes;
 use reth_transaction_pool::TransactionPool;
 use std::{
     future::Future,
@@ -54,7 +54,7 @@ impl<T: PayloadTypes> Future for ArbPayloadService<T> {
                 return Poll::Ready(());
             };
             match cmd {
-                PayloadServiceCommand::BuildNewPayload(attr, tx) => {
+                PayloadServiceCommand::BuildNewPayload(attr, _span, tx) => {
                     let id = attr.payload_id();
                     let _ = tx.send(Ok(id));
                 }

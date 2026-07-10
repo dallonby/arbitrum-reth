@@ -11,7 +11,7 @@ use arb_primitives::arbos_versions::{
     HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE_ARBITRUM, PRECOMPILE_MIN_ARBOS_VERSIONS,
 };
 use arb_storage::{
-    get_account_balance, set_account_code, set_account_nonce, storage_key_map, Detached, Storage,
+    set_account_nonce, storage_key_map, AccountStateBackend, Detached, Storage,
     StorageBackedAddress, StorageBackedBigUint, StorageBackedBytes, StorageBackedUint64,
     StorageBackend, SystemStateBackend, ARBOS_STATE_ADDRESS, FILTERED_TX_STATE_ADDRESS,
 };
@@ -294,12 +294,14 @@ impl<'a, D, B: Burner> ArbosState<'a, D, B> {
     }
 }
 
-impl<'a, D: Database, B: Burner> ArbosState<'a, D, B> {
-    pub fn set_format_version(&mut self, version: u64) -> Result<(), ArbosStateError> {
+impl<'a, D, B: Burner> ArbosState<'a, D, B> {
+    pub fn set_format_version<C: StorageBackend>(
+        &mut self,
+        backend: &mut C,
+        version: u64,
+    ) -> Result<(), ArbosStateError> {
         self.arbos_version = version;
-        Ok(self
-            .backing_storage
-            .set_by_uint64(VERSION_OFFSET, B256::from(U256::from(version)))?)
+        Ok(StorageBackedUint64::new(B256::ZERO, VERSION_OFFSET).set(backend, version)?)
     }
 
     /// Open existing ArbOS state from storage.
@@ -309,10 +311,10 @@ impl<'a, D: Database, B: Burner> ArbosState<'a, D, B> {
     /// when the backing storage layer fails, and
     /// [`ArbosStateError::UnsupportedVersion`] when the stored version is
     /// outside the range this build recognises.
-    pub fn open(
-        state: &'a mut revm::database::State<D>,
-        burner: B,
-    ) -> Result<Self, ArbosStateError> {
+    pub fn open(state: &'a mut revm::database::State<D>, burner: B) -> Result<Self, ArbosStateError>
+    where
+        D: Database,
+    {
         let backing_storage = Storage::new(state, B256::ZERO);
 
         let arbos_version = backing_storage.get_uint64_by_uint64(VERSION_OFFSET)?;
@@ -406,7 +408,7 @@ impl<'a, D: Database, B: Burner> ArbosState<'a, D, B> {
     }
 
     /// Checks and performs a scheduled ArbOS version upgrade if due.
-    pub fn upgrade_arbos_version_if_necessary<C: StorageBackend>(
+    pub fn upgrade_arbos_version_if_necessary<C: AccountStateBackend>(
         &mut self,
         backend: &mut C,
         current_timestamp: u64,
@@ -443,7 +445,7 @@ impl<'a, D: Database, B: Burner> ArbosState<'a, D, B> {
     }
 
     /// Performs version upgrade steps from current version up to `upgrade_to`.
-    pub fn upgrade_arbos_version<C: StorageBackend>(
+    pub fn upgrade_arbos_version<C: AccountStateBackend>(
         &mut self,
         backend: &mut C,
         upgrade_to: u64,
@@ -464,10 +466,9 @@ impl<'a, D: Database, B: Burner> ArbosState<'a, D, B> {
                 }
                 4..=9 => {}
                 10 => {
-                    // SAFETY: see `Storage` struct-level invariant.
-                    let state = unsafe { self.backing_storage.state_mut() };
-                    let pool_balance =
-                        get_account_balance(state, l1_pricing::L1_PRICER_FUNDS_POOL_ADDRESS);
+                    let pool_balance = backend
+                        .account_balance(l1_pricing::L1_PRICER_FUNDS_POOL_ADDRESS)
+                        .map_err(|e| ArbosStateError::Storage(e.into()))?;
                     self.l1_pricing_state
                         .set_l1_fees_available(backend, pool_balance)?;
                 }
@@ -510,14 +511,15 @@ impl<'a, D: Database, B: Burner> ArbosState<'a, D, B> {
                 32 => {}
                 33..=39 => {}
                 40 => {
-                    // SAFETY: see `Storage` struct-level invariant.
-                    let state = unsafe { self.backing_storage.state_mut() };
-                    set_account_nonce(state, HISTORY_STORAGE_ADDRESS, 1);
-                    set_account_code(
-                        state,
-                        HISTORY_STORAGE_ADDRESS,
-                        HISTORY_STORAGE_CODE_ARBITRUM.clone(),
-                    );
+                    backend
+                        .set_account_nonce(HISTORY_STORAGE_ADDRESS, 1)
+                        .map_err(|e| ArbosStateError::Storage(e.into()))?;
+                    backend
+                        .set_account_code(
+                            HISTORY_STORAGE_ADDRESS,
+                            HISTORY_STORAGE_CODE_ARBITRUM.clone(),
+                        )
+                        .map_err(|e| ArbosStateError::Storage(e.into()))?;
                     let mut params = self.programs.params(backend)?;
                     params.upgrade_to_arbos_version(next)?;
                     params.save(
@@ -556,11 +558,7 @@ impl<'a, D: Database, B: Burner> ArbosState<'a, D, B> {
                         &self.programs.backing_storage.open_sub_storage(&[0]),
                         backend,
                     )?;
-                    crate::address_set::initialize_address_set(
-                        &self
-                            .backing_storage
-                            .open_sub_storage(TRANSACTION_FILTERER_SUBSPACE),
-                    )?;
+                    self.transaction_filterers.clear(backend)?;
                 }
                 // ArbOS 61 fixes runtime accounting only; no state migration.
                 61 => {}
@@ -572,9 +570,9 @@ impl<'a, D: Database, B: Burner> ArbosState<'a, D, B> {
 
             for &(addr, version) in PRECOMPILE_MIN_ARBOS_VERSIONS {
                 if version == next {
-                    // SAFETY: see `Storage` struct-level invariant.
-                    let state = unsafe { self.backing_storage.state_mut() };
-                    set_account_code(state, addr, Bytes::from_static(&[0xFE]));
+                    backend
+                        .set_account_code(addr, Bytes::from_static(&[0xFE]))
+                        .map_err(|e| ArbosStateError::Storage(e.into()))?;
                 }
             }
 
@@ -602,7 +600,7 @@ impl<'a, D: Database, B: Burner> ArbosState<'a, D, B> {
                 .set_max_per_block_gas_limit(backend, l2_pricing::INITIAL_PER_BLOCK_GAS_LIMIT_V6)?;
         }
 
-        self.set_format_version(self.arbos_version)?;
+        self.set_format_version(backend, self.arbos_version)?;
 
         Ok(())
     }

@@ -4,13 +4,13 @@ use alloy_sol_types::SolInterface;
 use arb_context::ArbPrecompileCtx;
 use arb_storage::ARBOS_STATE_ADDRESS;
 
-use revm::{
-    context_interface::block::Block,
-    precompile::{PrecompileId, PrecompileOutput, PrecompileResult},
-};
+use revm::{context_interface::block::Block, precompile::PrecompileId};
 use std::sync::Arc;
 
-use crate::{interfaces::IArbGasInfo, ArbPrecompileError};
+use crate::{
+    interfaces::IArbGasInfo, ArbPrecompileError, ArbPrecompileOutput as PrecompileOutput,
+    ArbPrecompileResult as PrecompileResult,
+};
 
 /// ArbGasInfo precompile address (0x6c).
 pub const ARBGASINFO_ADDRESS: Address = Address::new([
@@ -28,9 +28,7 @@ const STORAGE_WRITE_COST: u64 = 20_000;
 use arbos::l1_pricing::L1_PRICER_FUNDS_POOL_ADDRESS;
 
 pub fn create_arbgasinfo_precompile(ctx: Arc<ArbPrecompileCtx>) -> DynPrecompile {
-    DynPrecompile::new_stateful(PrecompileId::custom("arbgasinfo"), move |input| {
-        handler(input, &ctx)
-    })
+    crate::new_arb_precompile(PrecompileId::custom("arbgasinfo"), ctx, handler)
 }
 
 fn handler(mut input: PrecompileInput<'_>, ctx: &ArbPrecompileCtx) -> PrecompileResult {

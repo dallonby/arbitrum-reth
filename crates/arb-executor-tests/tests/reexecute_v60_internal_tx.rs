@@ -124,10 +124,12 @@ fn reexecute_v60_start_block_persists_writes_to_bundle() {
         nonce: B64::from(1u64.to_be_bytes()),
         base_fee_per_gas: Some(HEADER_BASE_FEE),
         extra_data: Bytes::from(vec![0u8; 32]),
+        slot_number: None,
         parent_beacon_block_root: None,
         blob_gas_used: None,
         excess_blob_gas: None,
         requests_hash: None,
+        block_access_list_hash: None,
     };
 
     let block = Block::<ArbTransactionSigned> {

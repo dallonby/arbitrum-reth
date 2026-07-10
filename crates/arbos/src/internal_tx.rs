@@ -1,5 +1,5 @@
 use alloy_primitives::{Address, B256, U256};
-use arb_storage::{StorageBackend, StorageError};
+use arb_storage::{AccountStateBackend, StorageBackend, StorageError};
 
 use arb_chainspec::arbos_version;
 
@@ -330,7 +330,7 @@ pub struct InternalTxContext {
 /// - StartBlock: records L1 block hashes, reaps expired retryables, updates L2 pricing, and checks
 ///   for ArbOS upgrades.
 /// - BatchPostingReport (v1 and v2): updates L1 pricing based on batch poster spending.
-pub fn apply_internal_tx_update<D: revm::Database, B: Burner, F, G, C>(
+pub fn apply_internal_tx_update<D, B: Burner, F, G, C>(
     backend: &mut C,
     data: &[u8],
     state: &mut ArbosState<'_, D, B>,
@@ -341,7 +341,7 @@ pub fn apply_internal_tx_update<D: revm::Database, B: Burner, F, G, C>(
 where
     F: FnMut(Address, Address, U256) -> Result<(), BalanceError>,
     G: FnMut(Address) -> U256,
-    C: StorageBackend,
+    C: AccountStateBackend,
 {
     let Some(selector) = data.first_chunk::<4>().copied() else {
         return Err(InternalTxDecodeError::Length {
@@ -374,7 +374,7 @@ where
     }
 }
 
-fn apply_start_block<D: revm::Database, B: Burner, F, G, C>(
+fn apply_start_block<D, B: Burner, F, G, C>(
     backend: &mut C,
     inputs: StartBlockData,
     state: &mut ArbosState<'_, D, B>,
@@ -385,7 +385,7 @@ fn apply_start_block<D: revm::Database, B: Burner, F, G, C>(
 where
     F: FnMut(Address, Address, U256) -> Result<(), BalanceError>,
     G: FnMut(Address) -> U256,
-    C: StorageBackend,
+    C: AccountStateBackend,
 {
     let arbos_version = state.arbos_version();
 
@@ -433,7 +433,7 @@ where
     Ok(())
 }
 
-fn apply_batch_posting_report<D: revm::Database, B: Burner, F, C>(
+fn apply_batch_posting_report<D, B: Burner, F, C>(
     backend: &mut C,
     inputs: BatchPostingReportData,
     state: &mut ArbosState<'_, D, B>,
@@ -469,7 +469,7 @@ where
     Ok(())
 }
 
-fn apply_batch_posting_report_v2<D: revm::Database, B: Burner, F, C>(
+fn apply_batch_posting_report_v2<D, B: Burner, F, C>(
     backend: &mut C,
     inputs: BatchPostingReportV2Data,
     state: &mut ArbosState<'_, D, B>,

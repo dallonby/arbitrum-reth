@@ -43,11 +43,11 @@ use reth_node_core::{
 use reth_node_events::node;
 use reth_provider::{
     providers::{BlockchainProvider, NodeTypesForProvider},
-    BlockNumReader, StorageSettingsCache,
+    BalProvider, BlockNumReader, StateRootProvider, StorageSettingsCache,
 };
 use reth_tasks::TaskExecutor;
 use reth_tokio_util::EventSender;
-use reth_tracing::tracing::{debug, error, info};
+use reth_tracing::tracing::{debug, error, info, warn};
 use reth_trie_db::ChangesetCache;
 use std::{
     future::Future,
@@ -63,6 +63,7 @@ use arb_primitives::ArbPrimitives;
 static TREE_SENDER: OnceLock<TreeSender<ArbEngineTypes, ArbPrimitives>> = OnceLock::new();
 static ENGINE_HANDLE: OnceLock<ConsensusEngineHandle<ArbEngineTypes>> = OnceLock::new();
 static FLUSH_HANDLE: OnceLock<FlushHandle> = OnceLock::new();
+static SERIAL_STATE_ROOT_FN: OnceLock<SerialStateRootFn> = OnceLock::new();
 static PARALLEL_STATE_ROOT_FN: OnceLock<ParallelStateRootFn> = OnceLock::new();
 
 /// Request sent to the background persistence thread.
@@ -94,10 +95,23 @@ struct FlushHandle {
     flush_done: Arc<tokio::sync::Notify>,
 }
 
-/// Type-erased parallel state root function.
-type ParallelStateRootFn = Box<
+/// Type-erased canonical serial state-root function.
+type SerialStateRootFn = Box<
     dyn Fn(
             Arc<reth_trie_common::TrieInputSorted>,
+            reth_trie_common::prefix_set::TriePrefixSetsMut,
+        )
+            -> Result<(alloy_primitives::B256, reth_trie::updates::TrieUpdates), LauncherError>
+        + Send
+        + Sync,
+>;
+
+/// Type-erased Reth 2.3 parallel state-root function.
+type ParallelStateRootFn = Box<
+    dyn Fn(
+            alloy_primitives::B256,
+            reth_chain_state::StateTrieOverlayManager<ArbPrimitives>,
+            Arc<reth_trie_common::HashedPostStateSorted>,
             reth_trie_common::prefix_set::TriePrefixSets,
         )
             -> Result<(alloy_primitives::B256, reth_trie::updates::TrieUpdates), LauncherError>
@@ -151,14 +165,26 @@ pub fn flush_notifier() -> Option<Arc<tokio::sync::Notify>> {
     FLUSH_HANDLE.get().map(|handle| handle.flush_done.clone())
 }
 
-pub fn compute_parallel_state_root(
+pub fn compute_serial_state_root(
     overlay: Arc<reth_trie_common::TrieInputSorted>,
+    prefix_sets: reth_trie_common::prefix_set::TriePrefixSetsMut,
+) -> Result<(alloy_primitives::B256, reth_trie::updates::TrieUpdates), LauncherError> {
+    let f = SERIAL_STATE_ROOT_FN
+        .get()
+        .ok_or(LauncherError::ParallelStateRootNotInitialized)?;
+    f(overlay, prefix_sets)
+}
+
+pub fn compute_parallel_state_root(
+    parent_hash: alloy_primitives::B256,
+    overlays: reth_chain_state::StateTrieOverlayManager<ArbPrimitives>,
+    state: Arc<reth_trie_common::HashedPostStateSorted>,
     prefix_sets: reth_trie_common::prefix_set::TriePrefixSets,
 ) -> Result<(alloy_primitives::B256, reth_trie::updates::TrieUpdates), LauncherError> {
     let f = PARALLEL_STATE_ROOT_FN
         .get()
         .ok_or(LauncherError::ParallelStateRootNotInitialized)?;
-    f(overlay, prefix_sets)
+    f(parent_hash, overlays, state, prefix_sets)
 }
 
 /// Arbitrum engine node launcher.
@@ -206,6 +232,7 @@ impl ArbEngineLauncher {
         } = self;
         let NodeBuilderWithComponents {
             adapter: NodeTypesAdapter { database },
+            rocksdb_provider,
             components_builder,
             add_ons:
                 AddOns {
@@ -222,6 +249,24 @@ impl ArbEngineLauncher {
         } = hooks;
 
         let changeset_cache = ChangesetCache::new();
+        const FAST_NODE_DISABLED_STAGES: &[reth_stages_api::StageId] = &[
+            reth_stages_api::StageId::MerkleUnwind,
+            reth_stages_api::StageId::AccountHashing,
+            reth_stages_api::StageId::StorageHashing,
+            reth_stages_api::StageId::MerkleExecute,
+        ];
+        let rollup_args = crate::args::runtime_args();
+        let disabled_stages: &'static [reth_stages_api::StageId] = if rollup_args
+            .skip_state_root_validation
+        {
+            info!(
+                target: "reth::cli",
+                "NON-CANONICAL benchmark mode enabled: state-root placeholders change block hashes and ArbOS >=40 execution state from the following block; disabling hashing stages and trie proofs"
+            );
+            FAST_NODE_DISABLED_STAGES
+        } else {
+            &[]
+        };
 
         let ctx = ctx
             .with_configured_globals(engine_tree_config.reserved_cpu_cores())
@@ -231,6 +276,8 @@ impl ArbEngineLauncher {
             .with_adjusted_configs()
             .with_provider_factory::<_, <CB::Components as NodeComponents<T>>::Evm>(
                 changeset_cache.clone(),
+                rocksdb_provider,
+                disabled_stages,
             )
             .await?
             .inspect(|_| {
@@ -291,6 +338,7 @@ impl ArbEngineLauncher {
                 .clone()
                 .unwrap_or_else(ExExManagerHandle::empty),
             ctx.era_import_source(),
+            disabled_stages,
         )?;
 
         pipeline.move_to_static_files()?;
@@ -381,6 +429,14 @@ impl ArbEngineLauncher {
                                     let provider_rw = pf.database_provider_rw()?;
                                     provider_rw.save_blocks(flush.blocks, SaveBlocksMode::Full)?;
                                     provider_rw.commit()?;
+                                    let _ = pf.bal_store().flush().inspect_err(|err| {
+                                        warn!(
+                                            target: "reth::cli",
+                                            last_block = last.number,
+                                            ?err,
+                                            "Failed to flush BAL store"
+                                        );
+                                    });
                                     Ok(())
                                 })();
 
@@ -440,36 +496,48 @@ impl ArbEngineLauncher {
         }
 
         {
-            use reth_chain_state::{
-                AnchoredTrieInput, ComputedTrieData, DeferredTrieData, LazyOverlay,
-            };
-            use reth_provider::providers::OverlayStateProviderFactory;
+            use reth_provider::providers::{OverlayBuilder, OverlayStateProviderFactory};
             use reth_trie_parallel::root::ParallelStateRoot;
 
             let pf = ctx.provider_factory().clone();
+            let parallel_pf = pf.clone();
             let runtime = ctx.task_executor().clone();
-            let changeset_cache_for_root = changeset_cache.clone();
+            let root_changeset_cache = changeset_cache.clone();
 
-            let state_root_fn: ParallelStateRootFn = Box::new(move |overlay, prefix_sets| {
-                let anchor_hash = alloy_primitives::B256::ZERO;
-                let computed = ComputedTrieData {
-                    hashed_state: Arc::clone(&overlay.state),
-                    trie_updates: Arc::clone(&overlay.nodes),
-                    anchored_trie_input: Some(AnchoredTrieInput {
-                        anchor_hash,
-                        trie_input: overlay,
-                    }),
-                };
-                let lazy = LazyOverlay::new(anchor_hash, vec![DeferredTrieData::ready(computed)]);
-                let factory =
-                    OverlayStateProviderFactory::new(pf.clone(), changeset_cache_for_root.clone())
-                        .with_lazy_overlay(Some(lazy));
-
-                ParallelStateRoot::new(factory, prefix_sets, runtime.clone())
-                    .incremental_root_with_updates()
+            let serial_state_root_fn: SerialStateRootFn = Box::new(move |overlay, prefix_sets| {
+                // Reth 2.3 removed the old LazyOverlay/AnchoredTrieInput API.
+                // Preserve the complete cached trie input (both intermediate
+                // nodes and hashed post-state) by feeding it to the canonical
+                // latest-state root implementation. This remains exact; the
+                // parallel implementation will be rewired through Reth 2.3's
+                // StateTrieOverlayManager as a separate optimisation.
+                let mut input = reth_trie_common::TrieInput::from_blocks_sorted([(
+                    overlay.state.as_ref(),
+                    overlay.nodes.as_ref(),
+                )]);
+                input.prefix_sets = prefix_sets;
+                pf.latest()?
+                    .state_root_from_nodes_with_updates(input)
                     .map_err(LauncherError::from)
             });
-            let _ = PARALLEL_STATE_ROOT_FN.set(state_root_fn);
+            let _ = SERIAL_STATE_ROOT_FN.set(serial_state_root_fn);
+
+            let parallel_state_root_fn: ParallelStateRootFn =
+                Box::new(move |parent_hash, overlays, state, prefix_sets| {
+                    let overlay_builder = OverlayBuilder::<ArbPrimitives>::new(
+                        parent_hash,
+                        root_changeset_cache.clone(),
+                    )
+                    .with_state_trie_overlay_manager(overlays)
+                    .with_hashed_state_overlay(Some(state));
+                    let overlay_factory =
+                        OverlayStateProviderFactory::new(parallel_pf.clone(), overlay_builder);
+
+                    ParallelStateRoot::new(overlay_factory, prefix_sets, runtime.clone())
+                        .incremental_root_with_updates()
+                        .map_err(LauncherError::from)
+                });
+            let _ = PARALLEL_STATE_ROOT_FN.set(parallel_state_root_fn);
         }
 
         let (mut orchestrator, arb_tree_sender) = build_arb_engine_orchestrator(
@@ -488,6 +556,7 @@ impl ArbEngineLauncher {
             ctx.sync_metrics_tx(),
             ctx.components().evm_config().clone(),
             changeset_cache,
+            ctx.task_executor().clone(),
         );
 
         let _ = TREE_SENDER.set(arb_tree_sender);
@@ -524,7 +593,7 @@ impl ArbEngineLauncher {
 
         let (engine_shutdown, shutdown_rx) = EngineShutdown::new();
 
-        let initial_target = ctx.initial_backfill_target()?;
+        let initial_target = ctx.initial_backfill_target(disabled_stages)?;
         let mut built_payloads = ctx
             .components()
             .payload_builder_handle()
@@ -603,7 +672,7 @@ impl ArbEngineLauncher {
                     payload = built_payloads.select_next_some(), if !built_payloads.is_terminated() => {
                         if let Some(executed_block) = payload.executed_block() {
                             debug!(target: "reth::cli", block=?executed_block.recovered_block.num_hash(), "inserting built payload");
-                            orchestrator.handler_mut().handler_mut().on_event(EngineApiRequest::InsertExecutedBlock(executed_block.into_executed_payload()).into());
+                            orchestrator.handler_mut().handler_mut().on_event(EngineApiRequest::InsertExecutedBlock(executed_block).into());
                         }
                     }
                     shutdown_req = &mut shutdown_rx => {
@@ -646,10 +715,7 @@ impl ArbEngineLauncher {
         ctx.spawn_ethstats(engine_events_for_ethstats).await?;
 
         let handle = NodeHandle {
-            node_exit_future: NodeExitFuture::new(
-                async { rx.await? },
-                full_node.config.debug.terminate,
-            ),
+            node_exit_future: NodeExitFuture::new(async { rx.await? }),
             node: full_node,
         };
 

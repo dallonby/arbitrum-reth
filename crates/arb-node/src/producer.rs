@@ -9,9 +9,8 @@ use std::sync::{
 };
 
 use alloy_consensus::{
-    proofs,
-    transaction::{SignerRecoverable, TxHashRef},
-    Block, BlockBody, BlockHeader, Header, TxReceipt, EMPTY_OMMER_ROOT_HASH,
+    proofs, transaction::SignerRecoverable, Block, BlockBody, BlockHeader, Header, TxReceipt,
+    EMPTY_OMMER_ROOT_HASH,
 };
 use alloy_eips::eip2718::Decodable2718;
 use alloy_evm::{
@@ -21,7 +20,9 @@ use alloy_evm::{
 use alloy_primitives::{Address, Bytes, B256, B64, U256};
 use alloy_rpc_types_eth::BlockNumberOrTag;
 use parking_lot::Mutex;
-use reth_chain_state::{CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain};
+use reth_chain_state::{
+    CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain, StateTrieOverlayManager,
+};
 use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
 use reth_metrics::{
@@ -38,7 +39,9 @@ use revm_database::states::bundle_state::BundleRetention;
 use tracing::{debug, info, warn};
 
 use arb_evm::config::{arbos_version_from_mix_hash, l1_block_number_from_mix_hash, ArbEvmConfig};
-use arb_primitives::{signed_tx::ArbTransactionSigned, tx_types::ArbInternalTx, ArbPrimitives};
+use arb_primitives::{
+    signed_tx::ArbTransactionSigned, tx_types::ArbInternalTx, ArbPrimitives, ArbReceipt,
+};
 use arb_rpc::block_producer::{
     BlockProducer, BlockProducerError, BlockProductionInput, ProducedBlock,
 };
@@ -49,7 +52,33 @@ use arbos::{
     parse_l2::{parse_l2_transactions, parsed_tx_to_signed, ParsedTransaction},
 };
 
-use crate::genesis;
+use crate::{
+    args::StateRootAlgorithm,
+    genesis,
+    live_ipc::{
+        encode_live_ipc_message, LiveAccountChangeFrame, LiveAccountInfoChangeFrame,
+        LiveCanonicalBlockFrame, LiveCanonicalUpdateFrame, LiveChainLogFrame, LiveCheckpointFrame,
+        LiveIpcMessage, LiveReorgFrame, UdsPublisher,
+    },
+};
+
+/// State-root policy fixed for the lifetime of a block producer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StateRootConfig {
+    pub skip_validation: bool,
+    pub algorithm: StateRootAlgorithm,
+    pub verify_every: u64,
+}
+
+impl Default for StateRootConfig {
+    fn default() -> Self {
+        Self {
+            skip_validation: false,
+            algorithm: StateRootAlgorithm::Parallel,
+            verify_every: 0,
+        }
+    }
+}
 
 /// Trait to access the in-memory canonical state from a provider.
 ///
@@ -83,6 +112,18 @@ fn max_inflight() -> usize {
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_MAX_INFLIGHT)
+    })
+}
+
+/// Avoid rebuilding the cumulative serial-verification overlay on every block
+/// while the canonical root itself uses Reth's parallel overlay manager. The
+/// once-per-N verification block still takes the unchanged serial path, which
+/// differentially checks this accumulator before it can be trusted further.
+fn incremental_trie_accumulation_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ARB_INCREMENTAL_TRIE_ACCUMULATION")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
     })
 }
 
@@ -147,6 +188,26 @@ struct ArbBlockProducerMetrics {
     flush_commit_duration_seconds: Histogram,
     /// Seconds the producer stalled on backpressure, per occurrence.
     backpressure_stall_seconds: Histogram,
+    /// Wall-clock time spent computing a canonical state root.
+    state_root_duration_seconds: Histogram,
+    /// Number of blocks whose state root was intentionally skipped.
+    state_root_skipped_total: Counter,
+    /// Number of sampled serial/parallel root cross-checks.
+    state_root_verifications_total: Counter,
+    /// Number of sampled root cross-check mismatches.
+    state_root_verification_failures_total: Counter,
+    /// Time spent materializing and encoding an in-memory live IPC frame.
+    live_ipc_frame_build_duration_seconds: Histogram,
+    /// Frames queued for live IPC dispatch and bounded reconnect replay.
+    live_ipc_frames_published_total: Counter,
+    /// Frames rejected by the bounded dispatcher queue.
+    live_ipc_frames_dropped_total: Counter,
+    /// Number of live IPC clients currently connected.
+    live_ipc_connected_clients: Gauge,
+    /// Canonical/reorg frames retained for reconnect replay.
+    live_ipc_replay_frames: Gauge,
+    /// Encoded bytes retained for reconnect replay.
+    live_ipc_replay_bytes: Gauge,
 }
 
 /// Block producer using reth's save_blocks(Full) for persistence.
@@ -160,6 +221,8 @@ pub struct ArbBlockProducer<Provider> {
     scheduler: Mutex<FlushScheduler>,
     accumulated_trie_input: Mutex<Arc<TrieInputSorted>>,
     flushing_trie_input: Mutex<Option<Arc<TrieInputSorted>>>,
+    state_trie_overlays: StateTrieOverlayManager<ArbPrimitives>,
+    state_root_config: StateRootConfig,
     pending_flush: AtomicBool,
     produce_lock: tokio::sync::Mutex<()>,
     cached_init: Mutex<Option<arbos::arbos_types::ParsedInitMessage>>,
@@ -174,6 +237,8 @@ pub struct ArbBlockProducer<Provider> {
     /// or rollback so a stale chain view never feeds an SLOAD.
     cached_overlay: Mutex<Option<CachedOverlay>>,
     cached_prestate: Mutex<Option<CachedPrestate>>,
+    /// Optional pre-persistence canonical state-diff publisher for rarbi.
+    live_ipc: Option<Arc<UdsPublisher>>,
     metrics: ArbBlockProducerMetrics,
 }
 
@@ -191,7 +256,7 @@ struct CachedOverlay {
 
 struct CachedPrestate {
     parent_hash: B256,
-    contracts: Arc<alloy_primitives::map::HashMap<B256, revm::bytecode::Bytecode>>,
+    contracts: Arc<alloy_primitives::map::B256Map<revm::bytecode::Bytecode>>,
 }
 
 impl<Provider> ArbBlockProducer<Provider>
@@ -204,8 +269,14 @@ where
         evm_config: ArbEvmConfig,
         in_memory_state: CanonicalInMemoryState<ArbPrimitives>,
         flush_interval: u64,
+        state_root_config: StateRootConfig,
+        live_ipc: Option<Arc<UdsPublisher>>,
     ) -> Self {
-        let head = provider.last_block_number().unwrap_or(0);
+        // `last_block_number()` only sees the legacy MDBX canonical-header
+        // table. Storage V2 keeps canonical headers in static files, so use
+        // the layout-aware best block accessor for the persisted producer
+        // anchor.
+        let head = provider.best_block_number().unwrap_or(0);
         Self {
             provider,
             chain_spec,
@@ -216,6 +287,8 @@ where
             scheduler: Mutex::new(FlushScheduler::new(flush_interval)),
             accumulated_trie_input: Mutex::new(Arc::new(TrieInputSorted::default())),
             flushing_trie_input: Mutex::new(None),
+            state_trie_overlays: StateTrieOverlayManager::default(),
+            state_root_config,
             pending_flush: AtomicBool::new(false),
             produce_lock: tokio::sync::Mutex::new(()),
             cached_init: Mutex::new(None),
@@ -223,6 +296,7 @@ where
             validated_watcher: Mutex::new(None),
             cached_overlay: Mutex::new(None),
             cached_prestate: Mutex::new(None),
+            live_ipc,
             metrics: ArbBlockProducerMetrics::default(),
         }
     }
@@ -246,6 +320,23 @@ where
             overlay: overlay.clone(),
         });
         overlay
+    }
+
+    /// Extend the post-flush serial-verification accumulator without cloning
+    /// its full sorted maps when this producer holds the unique Arc.
+    fn extend_accumulated_trie_input(
+        &self,
+        state: &reth_trie_common::HashedPostStateSorted,
+        nodes: &reth_trie_common::updates::TrieUpdatesSorted,
+    ) {
+        let mut accumulated = self.accumulated_trie_input.lock();
+        let input = Arc::make_mut(&mut *accumulated);
+        if !state.is_empty() {
+            Arc::make_mut(&mut input.state).extend_ref_and_sort(state);
+        }
+        if !nodes.is_empty() {
+            Arc::make_mut(&mut input.nodes).extend_ref_and_sort(nodes);
+        }
     }
 
     fn extend_cached_overlay(&self, new_block_hash: B256, bundle: &BundleState) {
@@ -272,14 +363,14 @@ where
         &self,
         parent_hash: B256,
         head_state: Option<&reth_chain_state::BlockState<ArbPrimitives>>,
-    ) -> Arc<alloy_primitives::map::HashMap<B256, revm::bytecode::Bytecode>> {
+    ) -> Arc<alloy_primitives::map::B256Map<revm::bytecode::Bytecode>> {
         let mut cache = self.cached_prestate.lock();
         if let Some(c) = cache.as_ref() {
             if c.parent_hash == parent_hash {
                 return c.contracts.clone();
             }
         }
-        let mut contracts: alloy_primitives::map::HashMap<B256, revm::bytecode::Bytecode> =
+        let mut contracts: alloy_primitives::map::B256Map<revm::bytecode::Bytecode> =
             Default::default();
         if let Some(head_state) = head_state {
             for block_state in head_state.chain() {
@@ -349,7 +440,7 @@ where
             Ok(head)
         } else {
             self.provider
-                .last_block_number()
+                .best_block_number()
                 .map_err(|e| BlockProducerError::StateAccess(e.to_string()))
         }
     }
@@ -371,9 +462,26 @@ where
         let Some(result) = crate::launcher::try_flush_result() else {
             return false;
         };
+        let persisted_hashes = self
+            .in_memory_state
+            .head_state()
+            .map(|state| {
+                state
+                    .chain()
+                    .filter(|block_state| {
+                        block_state.block().recovered_block().number()
+                            <= result.last_num_hash.number
+                    })
+                    .map(|block_state| block_state.block().recovered_block().hash())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.state_trie_overlays.remove_blocks(persisted_hashes);
         self.in_memory_state
             .remove_persisted_blocks(result.last_num_hash);
-        *self.flushing_trie_input.lock() = None;
+        if !(self.state_root_config.skip_validation && self.state_root_config.verify_every != 0) {
+            *self.flushing_trie_input.lock() = None;
+        }
         self.pending_flush.store(false, Ordering::SeqCst);
         self.invalidate_cached_overlay();
         self.invalidate_cached_prestate();
@@ -540,6 +648,8 @@ where
             blob_gas_used: None,
             excess_blob_gas: None,
             requests_hash: None,
+            slot_number: None,
+            block_access_list_hash: None,
         };
 
         let evm_env = self
@@ -567,7 +677,6 @@ where
             .with_database(StateProviderDatabase::new(state_provider.as_ref()))
             .with_bundle_prestate(prestate)
             .with_bundle_update()
-            .without_state_clear()
             .build();
 
         let chain_id = self.chain_spec.chain().id();
@@ -626,15 +735,16 @@ where
                 let mut arb_state =
                     ArbosState::open(unsafe { &mut *state_ptr }, SystemBurner::new(None, false))
                         .map_err(|e| BlockProducerError::Execution(e.to_string()))?;
-                let _ = arb_state
-                    .l1_pricing_state
-                    .set_price_per_unit(unsafe { &mut *state_ptr }, init_msg.initial_l1_base_fee);
+                let _ = arb_state.l1_pricing_state.set_price_per_unit(
+                    arb_storage::StateDbBackend::from_mut(unsafe { &mut *state_ptr }),
+                    init_msg.initial_l1_base_fee,
+                );
                 if let Ok(target) = std::env::var("ARB_INITIAL_ARBOS_VERSION") {
                     if let Ok(target_version) = target.parse::<u64>() {
                         let current = arb_state.arbos_version();
                         if target_version > current {
                             if let Err(e) = arb_state.upgrade_arbos_version(
-                                unsafe { &mut *state_ptr },
+                                arb_storage::StateDbBackend::from_mut(unsafe { &mut *state_ptr }),
                                 target_version,
                                 true,
                             ) {
@@ -665,6 +775,7 @@ where
             ommers: &[],
             withdrawals: None,
             extra_data: exec_extra.into(),
+            slot_number: None,
         };
 
         // Create the block executor via the factory. A multi-gas inspector is
@@ -672,15 +783,17 @@ where
         // per-opcode resource attribution; it publishes each tx's multi-gas to
         // the shared sink the executor reads.
         let multi_gas_sink = arb_evm::multi_gas::MultiGasSink::default();
-        let evm = self
-            .evm_config
-            .block_executor_factory()
-            .evm_factory()
-            .create_evm_with_inspector(
+        let evm_factory = self.evm_config.block_executor_factory().evm_factory();
+        let inspector = arb_evm::multi_gas::MultiGasInspector::with_sink(multi_gas_sink.clone());
+        let evm = if arb_evm::multi_gas::sparse_inspector_enabled() {
+            evm_factory.create_evm_with_sparse_multigas_inspector(
                 &mut db,
                 evm_env.clone(),
-                arb_evm::multi_gas::MultiGasInspector::with_sink(multi_gas_sink.clone()),
-            );
+                inspector,
+            )
+        } else {
+            evm_factory.create_evm_with_inspector(&mut db, evm_env.clone(), inspector)
+        };
         let mut executor = self
             .evm_config
             .block_executor_factory()
@@ -838,90 +951,69 @@ where
             });
             match exec_outcome {
                 Ok(result) => {
-                    match executor.commit_transaction(result) {
-                        Ok(_gas_used) => {
-                            all_txs.push(signed_tx);
-                            if !hostio_records.is_empty() {
-                                arb_rpc::stylus_tracer::cache_trace(tx_hash, hostio_records);
-                            }
+                    let _ = executor.commit_transaction(result);
+                    all_txs.push(signed_tx);
+                    if !hostio_records.is_empty() {
+                        arb_rpc::stylus_tracer::cache_trace(tx_hash, hostio_records);
+                    }
 
-                            // Drain and execute any scheduled txs (auto-redeems).
-                            // After a SubmitRetryable or manual Redeem precompile call,
-                            // the executor queues retry txs that must execute in the
-                            // same block, immediately after the triggering tx.
-                            loop {
-                                let scheduled = executor.drain_scheduled_txs();
-                                debug!(
-                                    target: "block_producer",
-                                    count = scheduled.len(),
-                                    "Drained scheduled txs"
-                                );
-                                if scheduled.is_empty() {
-                                    break;
-                                }
-                                for encoded in scheduled {
-                                    let retry_tx: Option<ArbTransactionSigned> =
-                                        ArbTransactionSigned::decode_2718(&mut &encoded[..]).ok();
-                                    if let Some(retry_tx) = retry_tx {
-                                        let retry_signed = retry_tx.clone();
-                                        let retry_hash = *retry_signed.tx_hash();
-                                        match retry_tx.try_into_recovered() {
-                                            Ok(recovered_retry) => {
-                                                let (retry_outcome, retry_records) =
-                                                    arb_rpc::stylus_tracer::with_trace_buffer(
-                                                        || {
-                                                            executor
-                                                                .execute_transaction_without_commit(
-                                                                    recovered_retry,
-                                                                )
-                                                        },
+                    // Drain and execute any scheduled txs (auto-redeems).
+                    // After a SubmitRetryable or manual Redeem precompile call,
+                    // the executor queues retry txs that must execute in the
+                    // same block, immediately after the triggering tx.
+                    loop {
+                        let scheduled = executor.drain_scheduled_txs();
+                        debug!(
+                            target: "block_producer",
+                            count = scheduled.len(),
+                            "Drained scheduled txs"
+                        );
+                        if scheduled.is_empty() {
+                            break;
+                        }
+                        for encoded in scheduled {
+                            let retry_tx: Option<ArbTransactionSigned> =
+                                ArbTransactionSigned::decode_2718(&mut &encoded[..]).ok();
+                            if let Some(retry_tx) = retry_tx {
+                                let retry_signed = retry_tx.clone();
+                                let retry_hash = *retry_signed.tx_hash();
+                                match retry_tx.try_into_recovered() {
+                                    Ok(recovered_retry) => {
+                                        let (retry_outcome, retry_records) =
+                                            arb_rpc::stylus_tracer::with_trace_buffer(|| {
+                                                executor.execute_transaction_without_commit(
+                                                    recovered_retry,
+                                                )
+                                            });
+                                        match retry_outcome {
+                                            Ok(retry_result) => {
+                                                let _ = executor.commit_transaction(retry_result);
+                                                all_txs.push(retry_signed);
+                                                if !retry_records.is_empty() {
+                                                    arb_rpc::stylus_tracer::cache_trace(
+                                                        retry_hash,
+                                                        retry_records,
                                                     );
-                                                match retry_outcome {
-                                                    Ok(retry_result) => {
-                                                        match executor
-                                                            .commit_transaction(retry_result)
-                                                        {
-                                                            Ok(_) => {
-                                                                all_txs.push(retry_signed);
-                                                                if !retry_records.is_empty() {
-                                                                    arb_rpc::stylus_tracer::cache_trace(
-                                                                        retry_hash,
-                                                                        retry_records,
-                                                                    );
-                                                                }
-                                                            }
-                                                            Err(e) => {
-                                                                warn!(
-                                                                    target: "block_producer",
-                                                                    error = %e,
-                                                                    "Failed to commit auto-redeem tx"
-                                                                );
-                                                            }
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        warn!(
-                                                            target: "block_producer",
-                                                            error = %e,
-                                                            "Auto-redeem tx execution failed"
-                                                        );
-                                                    }
                                                 }
                                             }
                                             Err(e) => {
                                                 warn!(
                                                     target: "block_producer",
                                                     error = %e,
-                                                    "Failed to recover auto-redeem tx sender"
+                                                    "Auto-redeem tx execution failed"
                                                 );
                                             }
                                         }
                                     }
+                                    Err(e) => {
+                                        warn!(
+                                            target: "block_producer",
+                                            error = %e,
+                                            "Failed to recover auto-redeem tx sender"
+                                        );
+                                    }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            warn!(target: "block_producer", error = %e, "Failed to commit transaction");
                         }
                     }
                 }
@@ -1012,15 +1104,52 @@ where
         filter_unchanged_storage(&mut bundle);
         delete_empty_accounts(&mut bundle, &zombie_accounts, &*state_provider);
 
+        // `with_bundle_prestate` seeds execution with bytecode deployed by
+        // unflushed ancestor blocks. `take_bundle` retains that seed in
+        // `BundleState::contracts`, even though those contracts did not change
+        // in this block. Persisting the unfiltered map makes Storage V2 call
+        // `write_bytecodes` for the entire growing prestate once per block —
+        // quadratic write amplification across a flush batch. Keep only code
+        // whose hash actually changed in this block; the cached prestate below
+        // then remains exactly the union of unpersisted deployments.
+        let changed_code_hashes = bundle
+            .state
+            .values()
+            .filter(|account| account.is_contract_changed())
+            .filter_map(|account| account.info.as_ref().map(|info| info.code_hash))
+            .collect::<std::collections::HashSet<_>>();
+        bundle
+            .contracts
+            .retain(|code_hash, _| changed_code_hashes.contains(code_hash));
+
         let hashed_state =
             HashedPostState::from_bundle_state::<reth_trie_common::KeccakKeyHasher>(bundle.state());
 
-        let (state_root, trie_updates) = {
+        let block_state_sorted = Arc::new(hashed_state.into_sorted());
+        let block_prefix_sets = block_state_sorted.construct_prefix_sets();
+        let verify_root = self.state_root_config.verify_every != 0
+            && l2_block_number % self.state_root_config.verify_every == 0;
+        let root_started = std::time::Instant::now();
+
+        let use_incremental_accumulator = incremental_trie_accumulation_enabled()
+            && !self.state_root_config.skip_validation
+            && self.state_root_config.algorithm == StateRootAlgorithm::Parallel
+            && !verify_root;
+
+        let (state_root, trie_updates) = if use_incremental_accumulator {
+            let (root, updates) = crate::launcher::compute_parallel_state_root(
+                parent_header.hash(),
+                self.state_trie_overlays.clone(),
+                Arc::clone(&block_state_sorted),
+                block_prefix_sets.clone().freeze(),
+            )
+            .map_err(|e| BlockProducerError::Execution(format!("parallel state root: {e}")))?;
+            let updates = Arc::new(updates.into_sorted());
+            self.extend_accumulated_trie_input(&block_state_sorted, &updates);
+            (root, updates)
+        } else {
             let acc_arc = self.accumulated_trie_input.lock().clone();
             let flushing_arc = self.flushing_trie_input.lock().clone();
-
-            let block_state_sorted = hashed_state.clone().into_sorted();
-            let prefix_sets = block_state_sorted.construct_prefix_sets().freeze();
 
             let mut new_acc_state = (*acc_arc.state).clone();
             new_acc_state.extend_ref_and_sort(&block_state_sorted);
@@ -1042,20 +1171,147 @@ where
                 Default::default(),
             ));
 
-            let (root, updates) =
-                crate::launcher::compute_parallel_state_root(overlay, prefix_sets)
-                    .map_err(|e| BlockProducerError::Execution(format!("state root: {e}")))?;
+            if self.state_root_config.skip_validation {
+                self.metrics.state_root_skipped_total.increment(1);
+                if verify_root {
+                    let verify_prefix_sets = new_acc_state_arc.construct_prefix_sets();
+                    let (computed_root, _) = crate::launcher::compute_serial_state_root(
+                        Arc::clone(&overlay),
+                        verify_prefix_sets,
+                    )
+                    .map_err(|e| {
+                        BlockProducerError::Execution(format!(
+                            "diagnostic fast-node state root: {e}"
+                        ))
+                    })?;
+                    self.metrics.state_root_verifications_total.increment(1);
+                    info!(
+                        target: "block_producer",
+                        block_num = l2_block_number,
+                        ?computed_root,
+                        duration_ms = root_started.elapsed().as_millis() as u64,
+                        "Computed trie root for non-canonical fast-mode state"
+                    );
+                }
 
-            let mut new_acc_nodes = (*acc_arc.nodes).clone();
-            new_acc_nodes.extend_ref_and_sort(&updates.clone_into_sorted());
-            *self.accumulated_trie_input.lock() = Arc::new(TrieInputSorted::new(
-                Arc::new(new_acc_nodes),
-                new_acc_state_arc,
-                Default::default(),
-            ));
+                // Keep cumulative hashed state only when sampled verification is
+                // requested. This permits a bounded diagnostic run from a verified
+                // trie anchor without imposing root work on ordinary fast-node mode.
+                *self.accumulated_trie_input.lock() = if self.state_root_config.verify_every != 0 {
+                    Arc::new(TrieInputSorted::new(
+                        Arc::clone(&acc_arc.nodes),
+                        new_acc_state_arc,
+                        Default::default(),
+                    ))
+                } else {
+                    Arc::new(TrieInputSorted::default())
+                };
 
-            (root, updates)
+                (
+                    parent_header.state_root(),
+                    Arc::new(reth_trie_common::updates::TrieUpdatesSorted::default()),
+                )
+            } else {
+                let (root, updates) = match self.state_root_config.algorithm {
+                    StateRootAlgorithm::Parallel => {
+                        let parallel = crate::launcher::compute_parallel_state_root(
+                            parent_header.hash(),
+                            self.state_trie_overlays.clone(),
+                            Arc::clone(&block_state_sorted),
+                            block_prefix_sets.clone().freeze(),
+                        )
+                        .map_err(|e| {
+                            BlockProducerError::Execution(format!("parallel state root: {e}"))
+                        })?;
+
+                        if verify_root {
+                            let serial = crate::launcher::compute_serial_state_root(
+                                Arc::clone(&overlay),
+                                block_prefix_sets.clone(),
+                            )
+                            .map_err(|e| {
+                                BlockProducerError::Execution(format!(
+                                    "serial state-root cross-check: {e}"
+                                ))
+                            })?;
+                            self.metrics.state_root_verifications_total.increment(1);
+                            if parallel.0 != serial.0 {
+                                self.metrics
+                                    .state_root_verification_failures_total
+                                    .increment(1);
+                                return Err(BlockProducerError::Execution(format!(
+                                    "state-root algorithms disagree at block {l2_block_number}: parallel={} serial={}",
+                                    parallel.0, serial.0
+                                )));
+                            }
+                            info!(
+                                target: "block_producer",
+                                block_num = l2_block_number,
+                                state_root = ?parallel.0,
+                                "Parallel and serial state roots agree"
+                            );
+                        }
+                        parallel
+                    }
+                    StateRootAlgorithm::Serial => {
+                        let serial = crate::launcher::compute_serial_state_root(
+                            Arc::clone(&overlay),
+                            block_prefix_sets.clone(),
+                        )
+                        .map_err(|e| {
+                            BlockProducerError::Execution(format!("serial state root: {e}"))
+                        })?;
+
+                        if verify_root {
+                            let parallel = crate::launcher::compute_parallel_state_root(
+                                parent_header.hash(),
+                                self.state_trie_overlays.clone(),
+                                Arc::clone(&block_state_sorted),
+                                block_prefix_sets.clone().freeze(),
+                            )
+                            .map_err(|e| {
+                                BlockProducerError::Execution(format!(
+                                    "parallel state-root cross-check: {e}"
+                                ))
+                            })?;
+                            self.metrics.state_root_verifications_total.increment(1);
+                            if parallel.0 != serial.0 {
+                                self.metrics
+                                    .state_root_verification_failures_total
+                                    .increment(1);
+                                return Err(BlockProducerError::Execution(format!(
+                                    "state-root algorithms disagree at block {l2_block_number}: serial={} parallel={}",
+                                    serial.0, parallel.0
+                                )));
+                            }
+                            info!(
+                                target: "block_producer",
+                                block_num = l2_block_number,
+                                state_root = ?serial.0,
+                                "Serial and parallel state roots agree"
+                            );
+                        }
+                        serial
+                    }
+                };
+
+                let updates = Arc::new(updates.into_sorted());
+                let mut new_acc_nodes = (*acc_arc.nodes).clone();
+                new_acc_nodes.extend_ref_and_sort(updates.as_ref());
+                *self.accumulated_trie_input.lock() = Arc::new(TrieInputSorted::new(
+                    Arc::new(new_acc_nodes),
+                    new_acc_state_arc,
+                    Default::default(),
+                ));
+
+                (root, updates)
+            }
         };
+        if !self.state_root_config.skip_validation || verify_root {
+            self.metrics
+                .state_root_duration_seconds
+                .record(root_started.elapsed().as_secs_f64());
+        }
 
         // Derive header info (send_root, send_count, etc.) from post-execution state.
         let arb_info =
@@ -1125,6 +1381,8 @@ where
             blob_gas_used: None,
             excess_blob_gas: None,
             requests_hash: None,
+            slot_number: None,
+            block_access_list_hash: None,
         };
 
         let block = Block::<ArbTransactionSigned> {
@@ -1142,6 +1400,42 @@ where
         self.extend_cached_overlay(block_hash, &bundle);
         self.extend_cached_prestate(block_hash, &bundle);
 
+        // Materialize the feed frame while the per-block BundleState and receipts
+        // are still locally owned. Queue it only after the block has become
+        // canonical in Reth's in-memory state below. No MDBX work is involved.
+        let live_ipc_frame = self
+            .live_ipc
+            .as_ref()
+            .filter(|publisher| publisher.should_capture())
+            .map(|_| {
+                let started = std::time::Instant::now();
+                let result = encode_live_canonical_update(
+                    sealed.header(),
+                    block_hash,
+                    &sealed.body().transactions,
+                    &receipts,
+                    &bundle,
+                );
+                self.metrics
+                    .live_ipc_frame_build_duration_seconds
+                    .record(started.elapsed().as_secs_f64());
+                match result {
+                    Ok(frame) => Some(frame),
+                    Err(error) => {
+                        self.metrics.live_ipc_frames_dropped_total.increment(1);
+                        warn!(
+                            target: "live_ipc",
+                            block_num = l2_block_number,
+                            %block_hash,
+                            %error,
+                            "failed to encode live IPC canonical frame; block production will continue"
+                        );
+                        None
+                    }
+                }
+            })
+            .flatten();
+
         // Buffer block in memory for batched persistence.
         {
             use alloy_evm::block::BlockExecutionResult;
@@ -1149,7 +1443,19 @@ where
             use reth_execution_types::BlockExecutionOutput;
             use reth_primitives_traits::RecoveredBlock;
 
-            let recovered = Arc::new(RecoveredBlock::new_sealed(sealed.clone(), vec![]));
+            // Storage V2 persists transaction senders in a dedicated static-file segment.
+            // Every transaction in this block has already been recovered for execution, so this
+            // normally reads the warmed sender cache. Keeping the complete sender vector on the
+            // executed block is required for `save_blocks(Full)` to advance that segment in lockstep
+            // with transactions; an empty vector advances only its block index and makes startup
+            // consistency healing unwind the otherwise-durable blocks.
+            let recovered = Arc::new(RecoveredBlock::try_recover_sealed(sealed.clone()).map_err(
+                |e| {
+                    BlockProducerError::Execution(format!(
+                        "sender recovery for produced block {l2_block_number}: {e}"
+                    ))
+                },
+            )?);
             let exec_output = Arc::new(BlockExecutionOutput {
                 state: bundle,
                 result: BlockExecutionResult {
@@ -1160,12 +1466,12 @@ where
                 },
             });
             let computed = ComputedTrieData {
-                hashed_state: Arc::new(hashed_state.into_sorted()),
-                trie_updates: Arc::new(trie_updates.into_sorted()),
-                anchored_trie_input: None,
+                hashed_state: Arc::clone(&block_state_sorted),
+                trie_updates: Arc::clone(&trie_updates),
             };
             let executed = ExecutedBlock::new(recovered, exec_output, computed);
 
+            self.state_trie_overlays.insert_block(executed.clone());
             self.in_memory_state
                 .update_chain(NewCanonicalChain::Commit {
                     new: vec![executed],
@@ -1173,6 +1479,31 @@ where
 
             let sealed_header = SealedHeader::new(sealed.header().clone(), sealed.hash());
             self.in_memory_state.set_canonical_head(sealed_header);
+        }
+
+        if let (Some(publisher), Some(frame)) = (&self.live_ipc, live_ipc_frame) {
+            match publisher.publish(frame) {
+                Ok(()) => self.metrics.live_ipc_frames_published_total.increment(1),
+                Err(error) => {
+                    self.metrics.live_ipc_frames_dropped_total.increment(1);
+                    warn!(
+                        target: "live_ipc",
+                        block_num = l2_block_number,
+                        %block_hash,
+                        %error,
+                        "canonical block is in memory but its live IPC frame was not queued; consumers must detect the height/hash gap and resync"
+                    );
+                }
+            }
+            self.metrics
+                .live_ipc_connected_clients
+                .set(publisher.connected_client_count() as f64);
+            self.metrics
+                .live_ipc_replay_frames
+                .set(publisher.replay_frame_count() as f64);
+            self.metrics
+                .live_ipc_replay_bytes
+                .set(publisher.replay_byte_count() as f64);
         }
 
         self.head_block_num.store(l2_block_number, Ordering::SeqCst);
@@ -1231,9 +1562,14 @@ where
             last.recovered_block().hash(),
         );
 
-        // Double-buffer: move current accumulator to flushing slot.
-        let current = std::mem::take(&mut *self.accumulated_trie_input.lock());
-        *self.flushing_trie_input.lock() = Some(current);
+        // Double-buffer canonical trie input while the persistence transaction
+        // runs. A sampled fast-node verifier deliberately retains its cumulative
+        // hashed-state overlay because fast persistence does not advance trie
+        // tables; this is intended only for bounded diagnostic runs.
+        if !(self.state_root_config.skip_validation && self.state_root_config.verify_every != 0) {
+            let current = std::mem::take(&mut *self.accumulated_trie_input.lock());
+            *self.flushing_trie_input.lock() = Some(current);
+        }
 
         self.blocks_since_flush.store(0, Ordering::SeqCst);
         self.pending_flush.store(true, Ordering::SeqCst);
@@ -1327,7 +1663,7 @@ where
 
     async fn reset_to_block(&self, target_block_number: u64) -> Result<(), BlockProducerError> {
         let _lock = self.produce_lock.lock().await;
-        let current = self.head_block_num.load(Ordering::SeqCst);
+        let current = self.head_block_number()?;
         if target_block_number > current {
             return Err(BlockProducerError::Unexpected(format!(
                 "reset target {target_block_number} > current head {current}"
@@ -1336,6 +1672,12 @@ where
         if target_block_number == current {
             return Ok(());
         }
+
+        let old_tip_header = self.parent_header(current)?;
+        let old_tip = LiveCheckpointFrame {
+            block_number: current,
+            block_hash: old_tip_header.hash(),
+        };
 
         let header = self
             .provider
@@ -1370,6 +1712,11 @@ where
 
         // Reorg with no new blocks => pure rollback.
         if !old_blocks.is_empty() {
+            self.state_trie_overlays.remove_blocks(
+                old_blocks
+                    .iter()
+                    .map(|block| block.recovered_block().hash()),
+            );
             self.in_memory_state
                 .update_chain(reth_chain_state::NewCanonicalChain::Reorg {
                     new: Vec::new(),
@@ -1388,6 +1735,46 @@ where
         // extends from the new head.
         self.head_block_num
             .store(target_block_number, Ordering::SeqCst);
+
+        // Announce the in-memory rollback before the (potentially slower) MDBX
+        // unwind. As with canonical updates, transport failure is non-fatal to
+        // chain correctness and forces consumers to reconnect/resync.
+        if let Some(publisher) = self
+            .live_ipc
+            .as_ref()
+            .filter(|publisher| publisher.should_capture())
+        {
+            let revert_to = LiveCheckpointFrame {
+                block_number: target_block_number,
+                block_hash: header.hash(),
+            };
+            match encode_live_ipc_message(&LiveIpcMessage::Reorg(LiveReorgFrame {
+                old_tip,
+                revert_to,
+                new_chain: Vec::new(),
+            })) {
+                Ok(frame) => match publisher.publish(frame) {
+                    Ok(()) => self.metrics.live_ipc_frames_published_total.increment(1),
+                    Err(error) => {
+                        self.metrics.live_ipc_frames_dropped_total.increment(1);
+                        warn!(target: "live_ipc", target_block_number, %error, "live IPC reorg frame was not queued");
+                    }
+                },
+                Err(error) => {
+                    self.metrics.live_ipc_frames_dropped_total.increment(1);
+                    warn!(target: "live_ipc", target_block_number, %error, "failed to encode live IPC reorg frame");
+                }
+            }
+            self.metrics
+                .live_ipc_connected_clients
+                .set(publisher.connected_client_count() as f64);
+            self.metrics
+                .live_ipc_replay_frames
+                .set(publisher.replay_frame_count() as f64);
+            self.metrics
+                .live_ipc_replay_bytes
+                .set(publisher.replay_byte_count() as f64);
+        }
 
         // Also remove persisted blocks above target from disk. The worker
         // thread runs this serially with flushes to avoid races.
@@ -1409,6 +1796,14 @@ where
 
         // Invalidate any trie-input carrying the now-removed blocks.
         *self.accumulated_trie_input.lock() = Arc::new(TrieInputSorted::default());
+        *self.flushing_trie_input.lock() = None;
+
+        if self.state_root_config.skip_validation && self.state_root_config.verify_every != 0 {
+            warn!(
+                target: "block_producer",
+                "Fast-node state-root sampling was reset; restart from a verified trie checkpoint before relying on another sampled root"
+            );
+        }
 
         info!(
             target: "block_producer",
@@ -1471,6 +1866,123 @@ where
 // Helper functions
 // ---------------------------------------------------------------------------
 
+/// Encode the versioned canonical frame directly from this block's execution
+/// artifacts. This deliberately consumes only references so the same
+/// `BundleState` can then move into Reth's in-memory executed block.
+fn encode_live_canonical_update(
+    header: &Header,
+    block_hash: B256,
+    transactions: &[ArbTransactionSigned],
+    receipts: &[ArbReceipt],
+    bundle: &BundleState,
+) -> Result<Vec<u8>, BlockProducerError> {
+    let mut logs = Vec::new();
+    let mut log_index = 0u64;
+    for (tx_index, receipt) in receipts.iter().enumerate() {
+        let transaction_hash = transactions.get(tx_index).map(|tx| *tx.tx_hash());
+        for log in receipt.logs() {
+            logs.push(LiveChainLogFrame {
+                address: log.address,
+                topics: log.topics().to_vec(),
+                data: log.data.data.to_vec(),
+                transaction_hash,
+                transaction_index: Some(tx_index as u64),
+                log_index: Some(log_index),
+            });
+            log_index = log_index.saturating_add(1);
+        }
+    }
+
+    let mut state_changeset = Vec::new();
+    for (address, account) in &bundle.state {
+        let mut slots: Vec<(U256, U256)> = account
+            .storage
+            .iter()
+            .filter(|(_, slot)| slot.is_changed())
+            .map(|(key, slot)| (*key, slot.present_value))
+            .collect();
+
+        let account_change = if account.is_info_changed() {
+            match &account.info {
+                Some(present) => {
+                    let code = if account.is_contract_changed()
+                        && present.code_hash != alloy_primitives::KECCAK256_EMPTY
+                    {
+                        let bytecode = present
+                            .code
+                            .as_ref()
+                            .filter(|code| code.hash_slow() == present.code_hash)
+                            .or_else(|| bundle.contracts.get(&present.code_hash))
+                            .ok_or_else(|| {
+                                BlockProducerError::Execution(format!(
+                                    "live IPC changed code {} for {address} is unavailable",
+                                    present.code_hash
+                                ))
+                            })?;
+                        Some(bytecode.original_byte_slice().to_vec())
+                    } else {
+                        None
+                    };
+                    LiveAccountInfoChangeFrame::Updated {
+                        balance: present.balance,
+                        nonce: present.nonce,
+                        code_hash: present.code_hash,
+                        code,
+                    }
+                }
+                None => LiveAccountInfoChangeFrame::Deleted,
+            }
+        } else {
+            LiveAccountInfoChangeFrame::Unchanged
+        };
+
+        let storage_cleared = account.status.is_storage_known()
+            && (account.is_info_changed() || account.was_destroyed());
+        if slots.is_empty()
+            && !storage_cleared
+            && matches!(&account_change, LiveAccountInfoChangeFrame::Unchanged)
+        {
+            continue;
+        }
+        slots.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        state_changeset.push(LiveAccountChangeFrame {
+            address: *address,
+            account: account_change,
+            storage_cleared,
+            slots,
+        });
+    }
+    state_changeset.sort_unstable_by(|a, b| a.address.cmp(&b.address));
+
+    let update = LiveCanonicalUpdateFrame {
+        block: LiveCanonicalBlockFrame {
+            number: header.number,
+            hash: block_hash,
+            parent_hash: header.parent_hash,
+            timestamp: header.timestamp,
+            gas_limit: header.gas_limit,
+            base_fee_per_gas: header.base_fee_per_gas.map(U256::from),
+        },
+        logs,
+        pool_logs: None,
+        venus_logs: None,
+        impacted_accounts: Vec::new(),
+        pool_updates: Vec::new(),
+        venus_updates: Vec::new(),
+        state_changeset,
+        header_rlp: alloy_rlp::encode(header),
+        state_ready_unix_nanos: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .try_into()
+            .unwrap_or(u64::MAX),
+    };
+
+    encode_live_ipc_message(&LiveIpcMessage::CanonicalUpdate(update))
+        .map_err(|error| BlockProducerError::Execution(format!("encode live IPC update: {error}")))
+}
+
 /// Create an internal transaction (type 0x6A).
 fn create_internal_tx(chain_id: u64, data: &[u8]) -> ArbTransactionSigned {
     use arb_primitives::signed_tx::ArbTypedTransaction;
@@ -1500,9 +2012,7 @@ where
         .execute_transaction_without_commit(recovered)
         .map_err(|e| BlockProducerError::Execution(format!("{label} execution: {e}")))?;
 
-    executor
-        .commit_transaction(result)
-        .map_err(|e| BlockProducerError::Execution(format!("{label} commit: {e}")))?;
+    let _ = executor.commit_transaction(result);
 
     Ok(())
 }
@@ -1638,8 +2148,8 @@ fn augment_bundle_from_cache(
                 }
             };
 
-            let mut storage_changes: alloy_primitives::map::HashMap<U256, StorageSlot> =
-                alloy_primitives::map::HashMap::default();
+            let mut storage_changes: alloy_primitives::map::U256Map<StorageSlot> =
+                alloy_primitives::map::U256Map::default();
             for (key, value) in &current_storage {
                 let original_value = state_provider
                     .storage(*addr, B256::from(*key))

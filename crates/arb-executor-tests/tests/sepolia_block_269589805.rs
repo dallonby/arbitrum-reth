@@ -208,6 +208,7 @@ fn sepolia_269589805_sender_net_charges_match_canonical() {
         ommers: &[],
         withdrawals: None,
         extra_data: vec![0u8; 32].into(),
+        slot_number: None,
     };
     let mut executor = cfg
         .block_executor_factory()
@@ -230,7 +231,7 @@ fn sepolia_269589805_sender_net_charges_match_canonical() {
     let r = executor
         .execute_transaction_without_commit(Recovered::new_unchecked(sb, ARBOS_ADDRESS))
         .expect("startblock");
-    executor.commit_transaction(r).expect("commit sb");
+    executor.commit_transaction(r);
 
     for (i, raw) in [TX1, TX2, TX3, TX4].iter().enumerate() {
         let recovered = decode(raw);
@@ -243,7 +244,7 @@ fn sepolia_269589805_sender_net_charges_match_canonical() {
         let r = executor
             .execute_transaction_without_commit(recovered)
             .unwrap_or_else(|e| panic!("tx{} exec: {e:?}", i + 1));
-        executor.commit_transaction(r).expect("commit user");
+        executor.commit_transaction(r);
     }
     let _ = executor.finish().expect("finish");
 

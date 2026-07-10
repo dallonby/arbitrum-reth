@@ -3,6 +3,7 @@ use alloy_eips::eip2930::AccessList;
 use alloy_evm::tx::{FromRecoveredTx, FromTxWithEncoded, IntoTxEnv};
 use alloy_primitives::{Address, Bytes, U256};
 use arb_primitives::ArbTransactionSigned;
+use core::ops::{Deref, DerefMut};
 use reth_ethereum_primitives::TransactionSigned;
 use revm::context::TxEnv;
 
@@ -76,6 +77,26 @@ impl ArbTransaction {
     }
 }
 
+impl Deref for ArbTransaction {
+    type Target = TxEnv;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ArbTransaction {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl From<TxEnv> for ArbTransaction {
+    fn from(tx: TxEnv) -> Self {
+        Self(tx)
+    }
+}
+
 impl From<ArbTransaction> for TxEnv {
     fn from(arb_tx: ArbTransaction) -> Self {
         arb_tx.0
@@ -145,13 +166,9 @@ impl revm::context_interface::Transaction for ArbTransaction {
     }
 }
 
-impl reth_evm::TransactionEnv for ArbTransaction {
+impl reth_evm::TransactionEnvMut for ArbTransaction {
     fn set_gas_limit(&mut self, gas_limit: u64) {
         self.0.gas_limit = gas_limit;
-    }
-
-    fn nonce(&self) -> u64 {
-        self.0.nonce
     }
 
     fn set_nonce(&mut self, nonce: u64) {

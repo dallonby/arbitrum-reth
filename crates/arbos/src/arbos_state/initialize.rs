@@ -1,7 +1,7 @@
 use alloy_primitives::{Address, B256, U256};
 use arb_storage::{
-    set_account_nonce, Storage, StorageBackedAddress, StorageBackedBigUint, StorageBackend,
-    ARBOS_STATE_ADDRESS,
+    set_account_nonce, StateDbBackend, Storage, StorageBackedAddress, StorageBackedBigUint,
+    StorageBackend, ARBOS_STATE_ADDRESS,
 };
 use revm::{database::State, Database};
 
@@ -244,32 +244,32 @@ pub fn bootstrap<'a, D: Database, B: Burner>(
         // SAFETY: see `Storage` struct-level invariant. The `&mut State`
         // returned here is used transiently to drive `StorageBackend`-based
         // setters and is dropped before any subsequent use of `backing`.
-        let s = unsafe { backing.state_mut() };
+        let s = StateDbBackend::from_mut(unsafe { backing.state_mut() });
         StorageBackedBigUint::new(B256::ZERO, super::CHAIN_ID_OFFSET)
             .set(s, U256::from(chain_id))?;
         // SAFETY: see above.
-        let s = unsafe { backing.state_mut() };
+        let s = StateDbBackend::from_mut(unsafe { backing.state_mut() });
         StorageBackedAddress::new(B256::ZERO, super::NETWORK_FEE_ACCOUNT_OFFSET)
             .set(s, network_fee_account)?;
         // SAFETY: see above.
-        let s = unsafe { backing.state_mut() };
+        let s = StateDbBackend::from_mut(unsafe { backing.state_mut() });
         StorageBackedAddress::new(B256::ZERO, super::INFRA_FEE_ACCOUNT_OFFSET)
             .set(s, infra_fee_account)?;
 
         let l1_sto = backing.open_sub_storage(super::L1_PRICING_SUBSPACE);
         // SAFETY: see above.
-        let s = unsafe { backing.state_mut() };
+        let s = StateDbBackend::from_mut(unsafe { backing.state_mut() });
         L1PricingState::initialize(&l1_sto, s, network_fee_account, l1_initial_base_fee)?;
         let l2_sto = backing.open_sub_storage(super::L2_PRICING_SUBSPACE);
         // SAFETY: see above.
-        let s = unsafe { backing.state_mut() };
+        let s = StateDbBackend::from_mut(unsafe { backing.state_mut() });
         L2PricingState::<D>::initialize(&l2_sto, s)?;
         RetryableState::<D>::initialize(&backing.open_sub_storage(super::RETRYABLES_SUBSPACE))?;
     }
 
     let mut arbos = ArbosState::open(state, burner)?;
     // SAFETY: see `Storage` struct-level invariant.
-    let s = unsafe { arbos.backing_storage.state_mut() };
+    let s = StateDbBackend::from_mut(unsafe { arbos.backing_storage.state_mut() });
     arbos.upgrade_arbos_version(s, target_arbos_version, true)?;
     Ok(arbos)
 }

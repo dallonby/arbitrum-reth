@@ -81,6 +81,7 @@ fn run(call_target: Address) -> (bool, u64) {
         ommers: &[],
         withdrawals: None,
         extra_data: vec![0u8; 32].into(),
+        slot_number: None,
     };
     let mut executor = cfg
         .block_executor_factory()
@@ -105,7 +106,7 @@ fn run(call_target: Address) -> (bool, u64) {
         .expect("execute tx");
     (
         exec_result.result.result.is_success(),
-        exec_result.result.result.gas_used(),
+        exec_result.result.result.tx_gas_used(),
     )
 }
 

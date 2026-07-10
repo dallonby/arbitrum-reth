@@ -1,8 +1,7 @@
 use alloy_primitives::Bytes;
 use arb_storage_errors::StorageError;
 use core::error::Error;
-use revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
-use std::borrow::Cow;
+use revm::precompile::{PrecompileError, PrecompileHalt, PrecompileOutput, PrecompileResult};
 
 /// Errors raised by Arbitrum precompiles.
 ///
@@ -53,10 +52,9 @@ impl ArbPrecompileError {
 
     /// Converts this error into a [`PrecompileResult`], capped by `gas_limit`.
     ///
-    /// `Revert` produces a successful `PrecompileOutput::new_reverted` carrying
-    /// the configured selector and payload. `OutOfGas` and `Fatal` become
-    /// `Err`-variant `PrecompileError`s.
-    pub fn into_precompile_result(self, gas_limit: u64) -> PrecompileResult {
+    /// `Revert` and `OutOfGas` are non-fatal provider outputs in Revm 40.
+    /// Only `Fatal` becomes an `Err` and aborts execution.
+    pub fn into_precompile_result(self, gas_limit: u64, reservoir: u64) -> PrecompileResult {
         match self {
             Self::Revert {
                 selector,
@@ -72,12 +70,14 @@ impl ArbPrecompileError {
                     }
                     None => data,
                 };
-                Ok(PrecompileOutput::new_reverted(
+                Ok(PrecompileOutput::revert(
                     gas_used.min(gas_limit),
                     payload,
+                    reservoir,
                 ))
             }
-            other => Err(other.into()),
+            Self::OutOfGas => Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, reservoir)),
+            Self::Fatal(source) => Err(PrecompileError::Fatal(source.to_string())),
         }
     }
 }
@@ -85,15 +85,5 @@ impl ArbPrecompileError {
 impl From<StorageError> for ArbPrecompileError {
     fn from(err: StorageError) -> Self {
         Self::Fatal(Box::new(err))
-    }
-}
-
-impl From<ArbPrecompileError> for PrecompileError {
-    fn from(err: ArbPrecompileError) -> Self {
-        match err {
-            ArbPrecompileError::Revert { .. } => PrecompileError::Other(Cow::Borrowed("revert")),
-            ArbPrecompileError::OutOfGas => PrecompileError::OutOfGas,
-            ArbPrecompileError::Fatal(source) => PrecompileError::Fatal(source.to_string()),
-        }
     }
 }

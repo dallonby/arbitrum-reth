@@ -1,10 +1,11 @@
+use crate::{ArbPrecompileOutput as PrecompileOutput, ArbPrecompileResult as PrecompileResult};
 use alloy_evm::precompiles::{DynPrecompile, PrecompileInput};
 use alloy_primitives::{Address, Bytes, U256};
 use alloy_sol_types::SolInterface;
 use arb_context::ArbPrecompileCtx;
 use arb_storage::{write_cost, ARBOS_STATE_ADDRESS, STORAGE_READ_GAS, STORAGE_WRITE_GAS};
 use arbos::address_table::AddressTableError;
-use revm::precompile::{PrecompileId, PrecompileOutput, PrecompileResult};
+use revm::precompile::PrecompileId;
 use std::sync::Arc;
 
 use crate::{interfaces::IArbAddressTable, ArbPrecompileError};
@@ -20,9 +21,7 @@ const SSTORE_GAS: u64 = STORAGE_WRITE_GAS;
 const COPY_GAS: u64 = 3;
 
 pub fn create_arbaddresstable_precompile(ctx: Arc<ArbPrecompileCtx>) -> DynPrecompile {
-    DynPrecompile::new_stateful(PrecompileId::custom("arbaddresstable"), move |input| {
-        handler(input, &ctx)
-    })
+    crate::new_arb_precompile(PrecompileId::custom("arbaddresstable"), ctx, handler)
 }
 
 fn handler(mut input: PrecompileInput<'_>, ctx: &ArbPrecompileCtx) -> PrecompileResult {

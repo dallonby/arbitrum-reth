@@ -48,6 +48,7 @@ fn run_multi_tx_block(
         ommers: &[],
         withdrawals: None,
         extra_data: vec![0u8; 32].into(),
+        slot_number: None,
     };
 
     let mut executor = cfg
@@ -61,7 +62,7 @@ fn run_multi_tx_block(
         match executor.execute_transaction_without_commit(recovered) {
             Ok(result) => {
                 let success = result.result.result.is_success();
-                executor.commit_transaction(result).expect("commit");
+                executor.commit_transaction(result);
                 results.push(success);
             }
             Err(_) => results.push(false),

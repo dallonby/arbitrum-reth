@@ -59,6 +59,7 @@ fn arbitrum_deposit_persists_fresh_recipient_to_bundle() {
         ommers: &[],
         withdrawals: None,
         extra_data: vec![0u8; 32].into(),
+        slot_number: None,
     };
     let mut executor = cfg
         .block_executor_factory()
@@ -82,7 +83,7 @@ fn arbitrum_deposit_persists_fresh_recipient_to_bundle() {
     let result = executor
         .execute_transaction_without_commit(recovered)
         .expect("execute");
-    let _ = executor.commit_transaction(result).expect("commit");
+    let _ = executor.commit_transaction(result);
     let _ = executor.finish().expect("finish");
 
     let state = s.harness.state();
