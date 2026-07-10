@@ -118,9 +118,14 @@ impl ArbSimulationTransaction {
             }
         };
         let signer = tx.caller;
-        // Non-zero, fixed-width scalars model a normal signature's RLP shape.
-        // Recovery is intentionally bypassed by `Recovered::new_unchecked`.
-        let signature = Signature::new(U256::from(1), U256::from(2), false);
+        // Full-width non-zero scalars model a normal signature's RLP shape and
+        // compression cost. Recovery is intentionally bypassed by
+        // `Recovered::new_unchecked`.
+        let signature = Signature::new(
+            U256::from_be_bytes([0x11; 32]),
+            U256::from_be_bytes([0x22; 32]),
+            false,
+        );
         Ok(Self {
             environment,
             envelope: ArbTransactionSigned::new_unhashed(typed, signature),
