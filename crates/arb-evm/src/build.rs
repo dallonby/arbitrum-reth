@@ -2023,8 +2023,12 @@ where
         // protocol requires, so the BALANCE handler subtracts this correction
         // whenever it queries the sender's balance.
         {
-            let correction = actual_gas_price
-                .saturating_mul(U256::from(poster_gas.saturating_add(compute_hold_gas)));
+            let correction = if self.simulation_disable_fee_charging {
+                U256::ZERO
+            } else {
+                actual_gas_price
+                    .saturating_mul(U256::from(poster_gas.saturating_add(compute_hold_gas)))
+            };
             let correction_u128 = correction.try_into().unwrap_or(u128::MAX);
             self.precompile_ctx
                 .set_poster_balance_correction(correction_u128);

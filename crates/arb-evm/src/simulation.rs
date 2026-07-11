@@ -3,10 +3,12 @@
 //! Signed transactions retain their exact poster-cost bytes. Unsigned optimizer
 //! probes use a deterministic synthetic envelope and are estimates. Both paths
 //! share one `ArbBlockExecutor` per batch, including StartBlock when requested,
-//! poster-cost and multi-gas calculation, scheduled retryables, and
-//! per-transaction finalisation. Signed execution applies canonical fee/nonce
-//! state; relaxed unsigned execution deliberately suppresses those synthetic
-//! state writes while preserving execution-visible fee inputs and gas results.
+//! poster-cost and multi-gas calculation and per-transaction finalisation.
+//! Signed execution applies canonical fee/nonce state and scheduled retryables;
+//! relaxed unsigned execution deliberately suppresses synthetic fee/nonce state
+//! while preserving execution-visible fee inputs and gas results, and rejects a
+//! probe that schedules a retryable rather than mixing charged and no-charge
+//! lifecycle semantics.
 
 use std::fmt::Display;
 
@@ -187,6 +189,7 @@ impl ArbSimulationValidation {
 #[derive(Debug)]
 pub struct ArbSimulationOutput {
     pub result: ExecutionResult<HaltReason>,
+    pub poster_gas: u64,
     pub bundle: BundleState,
     pub progress: ArbSimulationProgress,
 }
@@ -194,6 +197,7 @@ pub struct ArbSimulationOutput {
 #[derive(Debug)]
 pub struct ArbSimulationTransactionOutput {
     pub result: ExecutionResult<HaltReason>,
+    pub poster_gas: u64,
     /// The core EVM writes for this transaction. `ArbSimulationBatchOutput::bundle`
     /// is authoritative for the cumulative EVM and ArbOS state transition.
     pub state: EvmState,
@@ -274,6 +278,7 @@ where
     })??;
     Ok(ArbSimulationOutput {
         result: transaction.result,
+        poster_gas: transaction.poster_gas,
         bundle: output.bundle,
         progress: output.progress,
     })
@@ -588,11 +593,16 @@ where
                 let result = output.result.result.clone();
                 let state = output.result.state.clone();
                 let _ = executor.commit_transaction(output);
-                drain_scheduled_transactions(&mut executor)?;
+                let poster_gas = executor.gas_used_for_l1.last().copied().unwrap_or_default();
+                drain_scheduled_transactions(&mut executor, validation.disable_fee_charging)?;
                 if index == 0 && matches!(block_start, SimulationBlockStart::Included) {
                     validate_monotonic_l1(executor.arb_ctx.l1_block_number)?;
                 }
-                transaction_outputs.push(Ok(ArbSimulationTransactionOutput { result, state }));
+                transaction_outputs.push(Ok(ArbSimulationTransactionOutput {
+                    result,
+                    poster_gas,
+                    state,
+                }));
             }
             Err(error) if error.as_validation().is_some() => {
                 let error = ArbSimulationError::Validation(error.to_string());
@@ -665,7 +675,10 @@ where
     Ok(())
 }
 
-fn drain_scheduled_transactions<E>(executor: &mut E) -> Result<(), ArbSimulationError>
+fn drain_scheduled_transactions<E>(
+    executor: &mut E,
+    reject_scheduled: bool,
+) -> Result<(), ArbSimulationError>
 where
     E: BlockExecutor<Transaction = ArbTransactionSigned> + ArbScheduledTxDrain,
 {
@@ -674,6 +687,7 @@ where
         if scheduled.is_empty() {
             return Ok(());
         }
+        ensure_scheduled_supported(&scheduled, reject_scheduled)?;
         for encoded in scheduled {
             let transaction =
                 ArbTransactionSigned::decode_2718(&mut &encoded[..]).map_err(|error| {
@@ -696,6 +710,18 @@ where
             let _ = executor.commit_transaction(output);
         }
     }
+}
+
+fn ensure_scheduled_supported(
+    scheduled: &[Vec<u8>],
+    reject_scheduled: bool,
+) -> Result<(), ArbSimulationError> {
+    if reject_scheduled && !scheduled.is_empty() {
+        return Err(ArbSimulationError::UnsupportedTransaction(
+            "unsigned no-charge simulation scheduled a retryable transaction".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -763,10 +789,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        // Write 42 to slot zero, then return BASEFEE || GASPRICE.
+        // Write 42 to slot zero, then return BASEFEE || GASPRICE ||
+        // BALANCE(caller).
         let code = Bytecode::new_raw(Bytes::from_static(&[
-            0x60, 0x2a, 0x60, 0x00, 0x55, 0x48, 0x60, 0x00, 0x52, 0x3a, 0x60, 0x20, 0x52, 0x60,
-            0x40, 0x60, 0x00, 0xf3,
+            0x60, 0x2a, 0x60, 0x00, 0x55, 0x48, 0x60, 0x00, 0x52, 0x3a, 0x60, 0x20, 0x52, 0x33,
+            0x31, 0x60, 0x40, 0x52, 0x60, 0x60, 0x60, 0x00, 0xf3,
         ]));
         database.insert_account(
             FEE_CONTEXT_CONTRACT,
@@ -778,6 +805,16 @@ mod tests {
         );
         database.merge_transitions(BundleRetention::PlainState);
         database
+    }
+
+    #[test]
+    fn relaxed_no_charge_mode_rejects_scheduled_retryables() {
+        let error = ensure_scheduled_supported(&[vec![0x68]], true).unwrap_err();
+        assert!(matches!(
+            error,
+            ArbSimulationError::UnsupportedTransaction(_)
+        ));
+        assert!(ensure_scheduled_supported(&[vec![0x68]], false).is_ok());
     }
 
     fn database_with_l1_number(l1_block_number: u64) -> TestDb {
@@ -989,7 +1026,7 @@ mod tests {
                 .execute_transaction_without_commit((environment, recovered))
                 .unwrap();
             let _ = executor.commit_transaction(output);
-            drain_scheduled_transactions(&mut executor).unwrap();
+            drain_scheduled_transactions(&mut executor, false).unwrap();
         }
         let progress = executor.simulation_progress();
         let zombie_accounts = executor.zombie_accounts();
@@ -1345,6 +1382,8 @@ mod tests {
 
     #[test]
     fn relaxed_unsigned_commit_preserves_state_without_synthetic_fee_or_nonce_writes() {
+        let mut fee_header = header();
+        fee_header.beneficiary = arbos::l1_pricing::BATCH_POSTER_ADDRESS;
         let block_start = Some(ArbSimulationBlockStart {
             l1_base_fee: U256::from(1_000_000_000u64),
             l1_block_number: 9,
@@ -1353,7 +1392,7 @@ mod tests {
         let baseline = execute_simulated_batch(
             &config(),
             database(),
-            &header(),
+            &fee_header,
             Vec::new(),
             ArbSimulationProgress::default(),
             block_start,
@@ -1377,7 +1416,7 @@ mod tests {
         let output = execute_simulated_transaction(
             &config(),
             database(),
-            &header(),
+            &fee_header,
             transaction,
             ArbSimulationProgress::default(),
             block_start,
@@ -1393,7 +1432,7 @@ mod tests {
         else {
             panic!("fee-context probe did not succeed: {:?}", output.result);
         };
-        assert_eq!(bytes.len(), 64);
+        assert_eq!(bytes.len(), 96);
         assert_eq!(
             U256::from_be_slice(&bytes[..32]),
             U256::from(HEADER_BASE_FEE)
@@ -1401,9 +1440,14 @@ mod tests {
         // ArbOS drops the tip and exposes its current L2 pricing-state base fee
         // through GASPRICE; the fixture bootstraps that value to 100m wei.
         assert_eq!(
-            U256::from_be_slice(&bytes[32..]),
+            U256::from_be_slice(&bytes[32..64]),
             U256::from(100_000_000u64)
         );
+        assert_eq!(
+            U256::from_be_slice(&bytes[64..]),
+            U256::from(10_000_000_000_000_000_000u128)
+        );
+        assert!(output.poster_gas > 0);
 
         let mut baseline_state = database();
         apply_bundle(&mut baseline_state, &baseline.bundle);
