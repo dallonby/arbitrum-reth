@@ -3,7 +3,7 @@ use alloy_eips::eip2718::{Encodable2718, Typed2718};
 use alloy_evm::{
     block::{
         BlockExecutionError, BlockExecutionResult, BlockExecutor, BlockExecutorFactory,
-        ExecutableTx, GasOutput, StateDB,
+        BlockValidationError, ExecutableTx, GasOutput, StateDB,
     },
     eth::{
         receipt_builder::ReceiptBuilder, spec::EthExecutorSpec, EthBlockExecutionCtx,
@@ -178,6 +178,9 @@ impl<R, Spec, EvmF> ArbBlockExecutorFactory<R, Spec, EvmF> {
             multi_gas_current_fees: std::sync::OnceLock::new(),
             state_overlay: StateOverlay::new(),
             multi_gas_sink: crate::multi_gas::MultiGasSink::default(),
+            simulation_disable_nonce_check: false,
+            simulation_disable_base_fee_check: false,
+            simulation_disable_balance_check: false,
         }
     }
 }
@@ -253,6 +256,9 @@ where
             multi_gas_current_fees: std::sync::OnceLock::new(),
             state_overlay: StateOverlay::new(),
             multi_gas_sink: crate::multi_gas::MultiGasSink::default(),
+            simulation_disable_nonce_check: false,
+            simulation_disable_base_fee_check: false,
+            simulation_disable_balance_check: false,
         }
     }
 }
@@ -354,6 +360,11 @@ pub struct ArbBlockExecutor<'a, Evm, Spec, R: ReceiptBuilder> {
     /// per-dimension gas to. Empty unless a [`MultiGasInspector`] is installed,
     /// in which case it drives the v60 multi-gas backlog.
     multi_gas_sink: crate::multi_gas::MultiGasSink,
+    /// Simulation-only overrides for checks implemented manually by ArbOS.
+    /// Canonical executors retain the strict `false` defaults.
+    simulation_disable_nonce_check: bool,
+    simulation_disable_base_fee_check: bool,
+    simulation_disable_balance_check: bool,
 }
 
 /// Simulation lifecycle and cumulative in-block counters that are not stored
@@ -423,6 +434,19 @@ impl<'a, Evm, Spec, R: ReceiptBuilder> ArbBlockExecutor<'a, Evm, Spec, R> {
     /// be the same slot held by the [`MultiGasInspector`] installed on `evm`.
     pub fn set_multi_gas_sink(&mut self, sink: crate::multi_gas::MultiGasSink) {
         self.multi_gas_sink = sink;
+    }
+
+    /// Relax manual user-transaction checks for unsigned speculative calls.
+    /// Canonical and signed execution leave every override disabled.
+    pub fn set_simulation_validation_overrides(
+        &mut self,
+        disable_nonce_check: bool,
+        disable_base_fee_check: bool,
+        disable_balance_check: bool,
+    ) {
+        self.simulation_disable_nonce_check = disable_nonce_check;
+        self.simulation_disable_base_fee_check = disable_base_fee_check;
+        self.simulation_disable_balance_check = disable_balance_check;
     }
 
     /// Restore cumulative counters after block-start state has initialized a
@@ -1328,7 +1352,7 @@ where
             !is_arb_internal && !is_arb_deposit && !is_submit_retryable && !is_retry_tx;
         const TX_GAS_MIN: u64 = 21_000;
         if is_user_tx && self.block_gas_left < TX_GAS_MIN {
-            return Err(BlockExecutionError::msg("block gas limit reached"));
+            return Err(BlockValidationError::msg("block gas limit reached").into());
         }
 
         // Reset per-tx processor state.
@@ -1933,7 +1957,7 @@ where
             const TX_GAS: u64 = 21_000;
             let compute_gas = tx_gas_limit.saturating_sub(poster_gas).max(TX_GAS);
             if compute_gas > self.block_gas_left {
-                return Err(BlockExecutionError::msg("block gas limit reached"));
+                return Err(BlockValidationError::msg("block gas limit reached").into());
             }
         }
 
@@ -2216,13 +2240,14 @@ where
             let sender_nonce = account.as_ref().map(|a| a.nonce).unwrap_or(0);
 
             // Nonce check: ContractTx skips (skipNonceChecks=true).
-            if !is_contract_tx {
+            if !is_contract_tx && !self.simulation_disable_nonce_check {
                 let tx_nonce = revm::context_interface::Transaction::nonce(&tx_env);
                 if tx_nonce != sender_nonce {
                     rollback_pre_exec_state(self, calldata_units)?;
-                    return Err(BlockExecutionError::msg(format!(
+                    return Err(BlockValidationError::msg(format!(
                         "nonce mismatch: address {sender} tx nonce {tx_nonce} != state nonce {sender_nonce}"
-                    )));
+                    ))
+                    .into());
                 }
             }
 
@@ -2237,28 +2262,31 @@ where
             // excludes deposit and internal, and retry/submit-retryable are not
             // user txs in this branch.
             let base_fee = self.arb_ctx.basefee;
-            if U256::from(upfront_gas_price) < base_fee {
+            if !self.simulation_disable_base_fee_check && U256::from(upfront_gas_price) < base_fee {
                 rollback_pre_exec_state(self, calldata_units)?;
-                return Err(BlockExecutionError::msg(format!(
+                return Err(BlockValidationError::msg(format!(
                     "max fee per gas less than block base fee: address {sender}, maxFeePerGas: {upfront_gas_price}, baseFee: {base_fee}"
-                )));
+                ))
+                .into());
             }
 
             let gas_cost = U256::from(tx_gas_limit) * U256::from(upfront_gas_price);
             let tx_value = revm::context_interface::Transaction::value(&tx_env);
             let total_cost = gas_cost.saturating_add(tx_value);
-            if sender_balance < total_cost {
+            if !self.simulation_disable_balance_check && sender_balance < total_cost {
                 rollback_pre_exec_state(self, calldata_units)?;
-                return Err(BlockExecutionError::msg(format!(
+                return Err(BlockValidationError::msg(format!(
                     "insufficient funds: address {sender} have {sender_balance} want {total_cost}"
-                )));
+                ))
+                .into());
             }
 
             if calldata_floor_gas > tx_gas_limit {
                 rollback_pre_exec_state(self, calldata_units)?;
-                return Err(BlockExecutionError::msg(format!(
+                return Err(BlockValidationError::msg(format!(
                     "insufficient gas for floor data gas: address {sender} gas limit {tx_gas_limit} floor {calldata_floor_gas}"
-                )));
+                ))
+                .into());
             }
         }
 

@@ -13,7 +13,7 @@ use alloy_eips::eip2718::Decodable2718;
 use alloy_evm::{
     block::{BlockExecutor, BlockExecutorFactory},
     eth::EthBlockExecutionCtx,
-    EvmFactory,
+    EvmFactory, RecoveredTx,
 };
 use alloy_primitives::{keccak256, Address, Bytes, Signature, U256};
 use arb_primitives::{tx_types::ArbInternalTx, ArbTransactionSigned, ArbTypedTransaction};
@@ -148,6 +148,33 @@ pub struct ArbSimulationBlockStart {
     pub time_passed: u64,
 }
 
+/// Manual ArbOS validation checks that unsigned speculative calls may relax.
+/// Exact signed and canonical execution must use [`Self::strict`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArbSimulationValidation {
+    pub disable_nonce_check: bool,
+    pub disable_base_fee_check: bool,
+    pub disable_balance_check: bool,
+}
+
+impl ArbSimulationValidation {
+    pub const fn strict() -> Self {
+        Self {
+            disable_nonce_check: false,
+            disable_base_fee_check: false,
+            disable_balance_check: false,
+        }
+    }
+
+    pub const fn relaxed() -> Self {
+        Self {
+            disable_nonce_check: true,
+            disable_base_fee_check: true,
+            disable_balance_check: true,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ArbSimulationOutput {
     pub result: ExecutionResult<HaltReason>,
@@ -170,6 +197,12 @@ pub struct ArbSimulationBatchOutput {
     pub progress: ArbSimulationProgress,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SimulationBlockStart {
+    Synthesized(Option<ArbSimulationBlockStart>),
+    Included,
+}
+
 pub fn execute_simulated_transaction<DB, E>(
     evm_config: &ArbEvmConfig<ChainSpec>,
     database: DB,
@@ -178,7 +211,7 @@ pub fn execute_simulated_transaction<DB, E>(
     progress: ArbSimulationProgress,
     block_start: Option<ArbSimulationBlockStart>,
     disable_eip3607: bool,
-    disable_nonce_check: bool,
+    validation: ArbSimulationValidation,
 ) -> Result<ArbSimulationOutput, ArbSimulationError>
 where
     DB: Database<Error = E> + DatabaseRef<Error = E> + std::fmt::Debug,
@@ -193,7 +226,7 @@ where
         progress,
         block_start,
         disable_eip3607,
-        disable_nonce_check,
+        validation,
         &mut inspector,
     )
 }
@@ -206,7 +239,7 @@ pub fn execute_simulated_transaction_with_inspector<DB, E, I>(
     progress: ArbSimulationProgress,
     block_start: Option<ArbSimulationBlockStart>,
     disable_eip3607: bool,
-    disable_nonce_check: bool,
+    validation: ArbSimulationValidation,
     inspector: &mut I,
 ) -> Result<ArbSimulationOutput, ArbSimulationError>
 where
@@ -222,7 +255,7 @@ where
         progress,
         block_start,
         disable_eip3607,
-        disable_nonce_check,
+        validation,
         inspector,
     )?;
     let transaction = output.transactions.pop().ok_or_else(|| {
@@ -245,7 +278,7 @@ pub fn execute_simulated_batch<DB, E>(
     progress: ArbSimulationProgress,
     block_start: Option<ArbSimulationBlockStart>,
     disable_eip3607: bool,
-    disable_nonce_check: bool,
+    validation: ArbSimulationValidation,
 ) -> Result<ArbSimulationBatchOutput, ArbSimulationError>
 where
     DB: Database<Error = E> + DatabaseRef<Error = E> + std::fmt::Debug,
@@ -260,7 +293,7 @@ where
         progress,
         block_start,
         disable_eip3607,
-        disable_nonce_check,
+        validation,
         &mut inspector,
     )
 }
@@ -273,7 +306,67 @@ pub fn execute_simulated_batch_with_inspector<DB, E, I>(
     progress: ArbSimulationProgress,
     block_start: Option<ArbSimulationBlockStart>,
     disable_eip3607: bool,
-    disable_nonce_check: bool,
+    validation: ArbSimulationValidation,
+    inspector: &mut I,
+) -> Result<ArbSimulationBatchOutput, ArbSimulationError>
+where
+    DB: Database<Error = E> + DatabaseRef<Error = E> + std::fmt::Debug,
+    E: std::error::Error + Display + Send + Sync + 'static,
+    I: for<'a> Inspector<reth_evm::eth::EthEvmContext<&'a mut State<DB>>>,
+{
+    execute_simulated_batch_inner(
+        evm_config,
+        database,
+        header,
+        transactions,
+        progress,
+        SimulationBlockStart::Synthesized(block_start),
+        disable_eip3607,
+        validation,
+        inspector,
+    )
+}
+
+/// Execute every original signed envelope in a historical ArbOS block.
+///
+/// The first envelope must be the block's exact internal StartBlock. Unlike
+/// unsigned simulation, validation is strict and any transaction failure
+/// aborts the block instead of returning a partial state transition.
+pub fn execute_simulated_signed_block<DB, E>(
+    evm_config: &ArbEvmConfig<ChainSpec>,
+    database: DB,
+    header: &Header,
+    transactions: Vec<ArbSimulationTransaction>,
+    disable_eip3607: bool,
+) -> Result<ArbSimulationBatchOutput, ArbSimulationError>
+where
+    DB: Database<Error = E> + DatabaseRef<Error = E> + std::fmt::Debug,
+    E: std::error::Error + Display + Send + Sync + 'static,
+{
+    validate_included_start_block(header, &transactions)?;
+    let mut inspector = NoOpInspector;
+    execute_simulated_batch_inner(
+        evm_config,
+        database,
+        header,
+        transactions,
+        ArbSimulationProgress::default(),
+        SimulationBlockStart::Included,
+        disable_eip3607,
+        ArbSimulationValidation::strict(),
+        &mut inspector,
+    )
+}
+
+fn execute_simulated_batch_inner<DB, E, I>(
+    evm_config: &ArbEvmConfig<ChainSpec>,
+    database: DB,
+    header: &Header,
+    transactions: Vec<ArbSimulationTransaction>,
+    progress: ArbSimulationProgress,
+    block_start: SimulationBlockStart,
+    disable_eip3607: bool,
+    validation: ArbSimulationValidation,
     inspector: &mut I,
 ) -> Result<ArbSimulationBatchOutput, ArbSimulationError>
 where
@@ -282,17 +375,19 @@ where
     I: for<'a> Inspector<reth_evm::eth::EthEvmContext<&'a mut State<DB>>>,
 {
     if !progress.block_initialized() {
-        let start = block_start.ok_or_else(|| {
-            ArbSimulationError::Execution(
-                "uninitialized simulation target requires StartBlock inputs".into(),
-            )
-        })?;
-        let header_l1_block = crate::config::l1_block_number_from_mix_hash(&header.mix_hash);
-        if start.l1_block_number != header_l1_block {
-            return Err(ArbSimulationError::Execution(format!(
-                "StartBlock L1 number {} does not match header mix-hash L1 number {header_l1_block}",
-                start.l1_block_number
-            )));
+        if let SimulationBlockStart::Synthesized(block_start) = block_start {
+            let start = block_start.ok_or_else(|| {
+                ArbSimulationError::Execution(
+                    "uninitialized simulation target requires StartBlock inputs".into(),
+                )
+            })?;
+            let header_l1_block = crate::config::l1_block_number_from_mix_hash(&header.mix_hash);
+            if start.l1_block_number != header_l1_block {
+                return Err(ArbSimulationError::Execution(format!(
+                    "StartBlock L1 number {} does not match header mix-hash L1 number {header_l1_block}",
+                    start.l1_block_number
+                )));
+            }
         }
     }
 
@@ -300,7 +395,7 @@ where
         .evm_env(header)
         .map_err(|error| ArbSimulationError::Execution(error.to_string()))?;
     evm_env.cfg_env.disable_eip3607 = disable_eip3607;
-    evm_env.cfg_env.disable_nonce_check = disable_nonce_check;
+    evm_env.cfg_env.disable_nonce_check = validation.disable_nonce_check;
     evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
 
     let mut state = StateBuilder::new()
@@ -327,6 +422,7 @@ where
         transactions,
         progress,
         block_start,
+        validation,
         multi_gas_sink,
     )?;
 
@@ -357,13 +453,66 @@ struct ExecutorMetadata {
     finalise_deleted: rustc_hash::FxHashSet<Address>,
 }
 
+fn validate_included_start_block(
+    header: &Header,
+    transactions: &[ArbSimulationTransaction],
+) -> Result<(), ArbSimulationError> {
+    let first = transactions.first().ok_or_else(|| {
+        ArbSimulationError::Execution("exact signed block contains no StartBlock".into())
+    })?;
+    let ArbTypedTransaction::Internal(internal) = first.recovered.tx().inner() else {
+        return Err(ArbSimulationError::Execution(
+            "exact signed block does not begin with an internal StartBlock".into(),
+        ));
+    };
+    if !internal
+        .data
+        .starts_with(&internal_tx::INTERNAL_TX_START_BLOCK_METHOD_ID)
+    {
+        return Err(ArbSimulationError::Execution(
+            "exact signed block does not begin with StartBlock".into(),
+        ));
+    }
+    let start = internal_tx::decode_start_block_data(&internal.data).map_err(|error| {
+        ArbSimulationError::Execution(format!("decode exact signed StartBlock: {error}"))
+    })?;
+    let header_l1_block = crate::config::l1_block_number_from_mix_hash(&header.mix_hash);
+    if start.l1_block_number != header_l1_block {
+        return Err(ArbSimulationError::Execution(format!(
+            "signed StartBlock L1 number {} does not match header mix-hash L1 number {header_l1_block}",
+            start.l1_block_number
+        )));
+    }
+    if start.l2_block_number != header.number {
+        return Err(ArbSimulationError::Execution(format!(
+            "signed StartBlock L2 number {} does not match header number {}",
+            start.l2_block_number, header.number
+        )));
+    }
+    for (index, transaction) in transactions.iter().enumerate().skip(1) {
+        if let ArbTypedTransaction::Internal(internal) = transaction.recovered.tx().inner() {
+            if internal
+                .data
+                .starts_with(&internal_tx::INTERNAL_TX_START_BLOCK_METHOD_ID)
+                && internal_tx::decode_start_block_data(&internal.data).is_ok()
+            {
+                return Err(ArbSimulationError::Execution(format!(
+                    "exact signed block contains a second StartBlock at transaction {index}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_batch_executor<'a, DB, E, I>(
     evm_config: &'a ArbEvmConfig<ChainSpec>,
     evm: ArbEvm<&'a mut State<DB>, I>,
     header: &Header,
     transactions: Vec<ArbSimulationTransaction>,
     progress: ArbSimulationProgress,
-    block_start: Option<ArbSimulationBlockStart>,
+    block_start: SimulationBlockStart,
+    validation: ArbSimulationValidation,
     multi_gas_sink: MultiGasSink,
 ) -> Result<ExecutorMetadata, ArbSimulationError>
 where
@@ -390,6 +539,11 @@ where
             .block_executor_factory()
             .create_arb_executor(evm, execution_ctx, chain_id);
     executor.set_multi_gas_sink(multi_gas_sink);
+    executor.set_simulation_validation_overrides(
+        validation.disable_nonce_check,
+        validation.disable_base_fee_check,
+        validation.disable_balance_check,
+    );
     if progress.block_initialized() {
         executor
             .prepare_simulation_continuation()
@@ -398,14 +552,14 @@ where
         executor
             .apply_pre_execution_changes()
             .map_err(|error| ArbSimulationError::Execution(error.to_string()))?;
-        if let Some(block_start) = block_start {
+        if let SimulationBlockStart::Synthesized(Some(block_start)) = block_start {
             execute_start_block(&mut executor, chain_id, header.number, block_start)?;
         }
     }
     executor.set_simulation_progress(progress);
 
     let mut transaction_outputs = Vec::with_capacity(transactions.len());
-    for transaction in transactions {
+    for (index, transaction) in transactions.into_iter().enumerate() {
         let (environment, recovered) = transaction.into_parts();
         match executor.execute_transaction_without_commit((environment, recovered)) {
             Ok(output) => {
@@ -416,10 +570,22 @@ where
                 transaction_outputs.push(Ok(ArbSimulationTransactionOutput { result, state }));
             }
             Err(error) if error.as_validation().is_some() => {
-                transaction_outputs.push(Err(ArbSimulationError::Validation(error.to_string())))
+                let error = ArbSimulationError::Validation(error.to_string());
+                if matches!(block_start, SimulationBlockStart::Included) {
+                    return Err(ArbSimulationError::Validation(format!(
+                        "exact signed transaction {index}: {error}"
+                    )));
+                }
+                transaction_outputs.push(Err(error))
             }
             Err(error) => {
-                transaction_outputs.push(Err(ArbSimulationError::Execution(error.to_string())))
+                let error = ArbSimulationError::Execution(error.to_string());
+                if matches!(block_start, SimulationBlockStart::Included) {
+                    return Err(ArbSimulationError::Execution(format!(
+                        "exact signed transaction {index}: {error}"
+                    )));
+                }
+                transaction_outputs.push(Err(error))
             }
         }
     }
@@ -801,7 +967,7 @@ mod tests {
             ArbSimulationProgress::initialized(Some(1_000_000), 7),
             None,
             false,
-            false,
+            ArbSimulationValidation::strict(),
         )
         .unwrap();
 
@@ -847,7 +1013,7 @@ mod tests {
             ArbSimulationProgress::initialized(Some(1_000_000), 2),
             None,
             false,
-            false,
+            ArbSimulationValidation::strict(),
         )
         .unwrap();
 
@@ -886,7 +1052,7 @@ mod tests {
             ArbSimulationProgress::default(),
             Some(block_start),
             false,
-            false,
+            ArbSimulationValidation::strict(),
         )
         .unwrap();
         assert!(batch.transactions.iter().all(|result| result
@@ -905,7 +1071,7 @@ mod tests {
             ArbSimulationProgress::default(),
             Some(block_start),
             false,
-            false,
+            ArbSimulationValidation::strict(),
         )
         .unwrap();
         let mut second_database = database();
@@ -918,7 +1084,7 @@ mod tests {
             first.progress,
             Some(block_start),
             false,
-            false,
+            ArbSimulationValidation::strict(),
         )
         .unwrap();
 
@@ -935,6 +1101,125 @@ mod tests {
         assert_eq!(batch.progress, second.progress);
         assert!(batch.progress.block_initialized());
         assert_eq!(batch.progress.user_txs_processed(), 2);
+    }
+
+    #[test]
+    fn exact_signed_block_matches_synthesized_start_block_execution() {
+        let block_start = ArbSimulationBlockStart {
+            l1_base_fee: U256::from(1_000_000_000u64),
+            l1_block_number: 9,
+            time_passed: 0,
+        };
+        let user_transaction = || {
+            ArbSimulationTransaction::from_signed(
+                signed_1559(0, RECIPIENT, U256::from(123u64), Bytes::new())
+                    .try_into_recovered()
+                    .unwrap(),
+            )
+        };
+        let synthesized = execute_simulated_batch(
+            &config(),
+            database(),
+            &header(),
+            vec![user_transaction()],
+            ArbSimulationProgress::default(),
+            Some(block_start),
+            false,
+            ArbSimulationValidation::strict(),
+        )
+        .unwrap();
+        let start_transaction = create_internal_transaction(
+            CHAIN_ID,
+            &internal_tx::encode_start_block(
+                block_start.l1_base_fee,
+                block_start.l1_block_number,
+                header().number,
+                block_start.time_passed,
+            ),
+        );
+        let exact = execute_simulated_signed_block(
+            &config(),
+            database(),
+            &header(),
+            vec![
+                ArbSimulationTransaction::from_signed(
+                    start_transaction.try_into_recovered().unwrap(),
+                ),
+                user_transaction(),
+            ],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(synthesized.transactions.len(), 1);
+        assert_eq!(exact.transactions.len(), 2);
+        assert!(exact.transactions.iter().all(|result| result
+            .as_ref()
+            .is_ok_and(|output| output.result.is_success())));
+        let mut synthesized_state = database();
+        apply_bundle(&mut synthesized_state, &synthesized.bundle);
+        let mut exact_state = database();
+        apply_bundle(&mut exact_state, &exact.bundle);
+        assert_same_cached_state(&synthesized_state, &exact_state);
+        assert_eq!(synthesized.progress, exact.progress);
+    }
+
+    #[test]
+    fn relaxed_unsigned_call_executes_with_zero_fee_and_unfunded_caller() {
+        let transaction = || {
+            ArbSimulationTransaction::from_environment(
+                ArbTransaction(reth_revm::context::TxEnv {
+                    caller: Address::ZERO,
+                    gas_limit: 500_000,
+                    gas_price: 0,
+                    kind: TxKind::Call(L1_NUMBER_CONTRACT),
+                    chain_id: Some(CHAIN_ID),
+                    ..Default::default()
+                }),
+                CHAIN_ID,
+            )
+            .unwrap()
+        };
+        let block_start = Some(ArbSimulationBlockStart {
+            l1_base_fee: U256::from(1_000_000_000u64),
+            l1_block_number: 9,
+            time_passed: 0,
+        });
+        let strict = execute_simulated_transaction(
+            &config(),
+            database(),
+            &header(),
+            transaction(),
+            ArbSimulationProgress::default(),
+            block_start,
+            true,
+            ArbSimulationValidation::strict(),
+        )
+        .unwrap_err();
+        assert!(strict.is_validation(), "{strict}");
+
+        let relaxed = execute_simulated_transaction(
+            &config(),
+            database(),
+            &header(),
+            transaction(),
+            ArbSimulationProgress::default(),
+            block_start,
+            true,
+            ArbSimulationValidation::relaxed(),
+        )
+        .unwrap();
+        let ExecutionResult::Success {
+            output: Output::Call(bytes),
+            ..
+        } = relaxed.result
+        else {
+            panic!(
+                "relaxed unsigned call did not succeed: {:?}",
+                relaxed.result
+            );
+        };
+        assert_eq!(U256::from_be_slice(&bytes), U256::from(9u64));
     }
 
     #[test]
@@ -958,7 +1243,7 @@ mod tests {
                 time_passed: 0,
             }),
             false,
-            false,
+            ArbSimulationValidation::strict(),
         )
         .unwrap();
 
@@ -983,7 +1268,7 @@ mod tests {
                 time_passed: 0,
             }),
             false,
-            false,
+            ArbSimulationValidation::strict(),
         )
         .unwrap_err();
         assert!(mismatch
@@ -1009,7 +1294,7 @@ mod tests {
             progress,
             None,
             false,
-            false,
+            ArbSimulationValidation::strict(),
         )
         .unwrap();
 
@@ -1038,7 +1323,7 @@ mod tests {
             ArbSimulationProgress::default(),
             Some(block_start),
             false,
-            false,
+            ArbSimulationValidation::strict(),
         )
         .unwrap();
 
@@ -1052,7 +1337,7 @@ mod tests {
             initialized.progress.clone(),
             None,
             false,
-            false,
+            ArbSimulationValidation::strict(),
         )
         .unwrap();
         let batch_second_gas = batch.transactions[1].as_ref().unwrap().result.tx_gas_used();
@@ -1067,7 +1352,7 @@ mod tests {
             initialized.progress,
             None,
             false,
-            false,
+            ArbSimulationValidation::strict(),
         )
         .unwrap();
         let mut second_database = stylus_database();
@@ -1081,7 +1366,7 @@ mod tests {
             first.progress,
             None,
             false,
-            false,
+            ArbSimulationValidation::strict(),
         )
         .unwrap();
 

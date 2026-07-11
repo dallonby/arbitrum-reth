@@ -216,6 +216,40 @@ pub enum SequencerExecutionError {
     State(String),
     #[error("sequencer execution: {0}")]
     Execution(String),
+    #[error("sequencer transaction {parsed_index} failed during {stage:?}: {reason}")]
+    Transaction {
+        parsed_index: usize,
+        stage: SequencerTransactionFailureStage,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequencerTransactionFailureStage {
+    Preparation,
+    Execution,
+    ScheduledDecode,
+    ScheduledRecovery,
+    ScheduledExecution,
+}
+
+fn transaction_failure(
+    parsed_index: usize,
+    stage: SequencerTransactionFailureStage,
+    reason: impl Into<String>,
+) -> SequencerExecutionError {
+    let reason = reason.into();
+    tracing::error!(
+        parsed_index,
+        ?stage,
+        %reason,
+        "rejecting sequencer block rather than publishing partial state"
+    );
+    SequencerExecutionError::Transaction {
+        parsed_index,
+        stage,
+        reason,
+    }
 }
 
 /// Execute a complete ordered sequencer message without persistence or trie
@@ -352,7 +386,7 @@ where
 
     let mut transactions = Vec::with_capacity(parsed_txs.len().saturating_add(1));
     let mut user_executions = Vec::with_capacity(parsed_txs.len());
-    let mut skipped = Vec::new();
+    let skipped = Vec::new();
 
     let start_block_data = internal_tx::encode_start_block(
         input.l1_base_fee.unwrap_or(U256::ZERO),
@@ -371,9 +405,7 @@ where
     let mut user_evm_execution = Duration::ZERO;
     let mut user_result_capture = Duration::ZERO;
     let mut user_commit = Duration::ZERO;
-    'transactions: for (chunk_index, parsed_chunk) in
-        parsed_txs.chunks(RECOVERY_CHUNK_SIZE).enumerate()
-    {
+    for (chunk_index, parsed_chunk) in parsed_txs.chunks(RECOVERY_CHUNK_SIZE).enumerate() {
         let preparation_started = std::time::Instant::now();
         let prepared_chunk = prepare_sequencer_chunk(parsed_chunk, chain_id);
         user_preparation = user_preparation.saturating_add(preparation_started.elapsed());
@@ -423,18 +455,18 @@ where
             let (signed, recovered) = match prepared {
                 Some(Ok(prepared)) => prepared,
                 Some(Err(reason)) => {
-                    skipped.push(SkippedSequencerTransaction {
+                    return Err(transaction_failure(
                         parsed_index,
+                        SequencerTransactionFailureStage::Preparation,
                         reason,
-                    });
-                    continue;
+                    ));
                 }
                 None => {
-                    skipped.push(SkippedSequencerTransaction {
+                    return Err(transaction_failure(
                         parsed_index,
-                        reason: "user transaction preparation was unavailable".into(),
-                    });
-                    continue;
+                        SequencerTransactionFailureStage::Preparation,
+                        "user transaction preparation was unavailable",
+                    ));
                 }
             };
 
@@ -460,20 +492,19 @@ where
                         &mut transactions,
                         &mut user_executions,
                         parsed_index,
-                        &mut skipped,
                         &mut user_preparation,
                         &mut user_evm_execution,
                         &mut user_result_capture,
                         &mut user_commit,
-                    );
+                    )?;
                 }
-                Err(error) if error.to_string().contains("block gas limit reached") => {
-                    break 'transactions
+                Err(error) => {
+                    return Err(transaction_failure(
+                        parsed_index,
+                        SequencerTransactionFailureStage::Execution,
+                        error.to_string(),
+                    ));
                 }
-                Err(error) => skipped.push(SkippedSequencerTransaction {
-                    parsed_index,
-                    reason: format!("execution: {error}"),
-                }),
             }
         }
     }
@@ -591,12 +622,12 @@ fn drain_scheduled<E>(
     transactions: &mut Vec<ArbTransactionSigned>,
     user_executions: &mut Vec<SequencerTransactionExecution>,
     parsed_index: usize,
-    skipped: &mut Vec<SkippedSequencerTransaction>,
     user_preparation: &mut Duration,
     user_evm_execution: &mut Duration,
     user_result_capture: &mut Duration,
     user_commit: &mut Duration,
-) where
+) -> Result<(), SequencerExecutionError>
+where
     E: BlockExecutor<
             Transaction = ArbTransactionSigned,
             Result = alloy_evm::eth::EthTxResult<
@@ -608,30 +639,26 @@ fn drain_scheduled<E>(
     loop {
         let scheduled = executor.drain_scheduled_txs();
         if scheduled.is_empty() {
-            return;
+            return Ok(());
         }
         for encoded in scheduled {
             let preparation_started = std::time::Instant::now();
-            let Some(retry) = ArbTransactionSigned::decode_2718(&mut &encoded[..]).ok() else {
+            let retry = ArbTransactionSigned::decode_2718(&mut &encoded[..]).map_err(|error| {
                 *user_preparation = user_preparation.saturating_add(preparation_started.elapsed());
-                skipped.push(SkippedSequencerTransaction {
+                transaction_failure(
                     parsed_index,
-                    reason: "scheduled retryable decode".into(),
-                });
-                continue;
-            };
-            let recovered = match retry.clone().try_into_recovered() {
-                Ok(recovered) => recovered,
-                Err(error) => {
-                    *user_preparation =
-                        user_preparation.saturating_add(preparation_started.elapsed());
-                    skipped.push(SkippedSequencerTransaction {
-                        parsed_index,
-                        reason: format!("scheduled retryable recovery: {error:?}"),
-                    });
-                    continue;
-                }
-            };
+                    SequencerTransactionFailureStage::ScheduledDecode,
+                    error.to_string(),
+                )
+            })?;
+            let recovered = retry.clone().try_into_recovered().map_err(|error| {
+                *user_preparation = user_preparation.saturating_add(preparation_started.elapsed());
+                transaction_failure(
+                    parsed_index,
+                    SequencerTransactionFailureStage::ScheduledRecovery,
+                    format!("{error:?}"),
+                )
+            })?;
             *user_preparation = user_preparation.saturating_add(preparation_started.elapsed());
             let evm_started = std::time::Instant::now();
             let execution = executor.execute_transaction_without_commit(recovered);
@@ -651,10 +678,13 @@ fn drain_scheduled<E>(
                     let _ = executor.commit_transaction(result);
                     *user_commit = user_commit.saturating_add(commit_started.elapsed());
                 }
-                Err(error) => skipped.push(SkippedSequencerTransaction {
-                    parsed_index,
-                    reason: format!("scheduled retryable execution: {error}"),
-                }),
+                Err(error) => {
+                    return Err(transaction_failure(
+                        parsed_index,
+                        SequencerTransactionFailureStage::ScheduledExecution,
+                        error.to_string(),
+                    ));
+                }
             }
         }
     }
@@ -828,6 +858,11 @@ pub(crate) fn filter_unchanged_storage(bundle: &mut BundleState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::{
+        crypto::secp256k1::sign_message, EthereumTxEnvelope, SignableTransaction, TxEip1559,
+    };
+    use alloy_eips::eip2718::Encodable2718;
+    use alloy_primitives::{b256, TxKind};
     use arb_storage::ARBOS_STATE_ADDRESS;
     use arbos::{arbos_state::initialize::bootstrap, burn::SystemBurner};
     use reth_revm::state::AccountInfo;
@@ -932,6 +967,87 @@ mod tests {
         assert_eq!(output.transactions.len(), 1, "StartBlock only");
         assert!(output.skipped.is_empty());
         assert!(!output.bundle.state.is_empty());
+    }
+
+    #[test]
+    fn rejects_entire_message_when_a_user_transaction_cannot_execute() {
+        let mut parent_db = StateBuilder::new()
+            .with_database(reth_revm::db::CacheDB::new(
+                reth_revm::db::EmptyDB::default(),
+            ))
+            .with_bundle_update()
+            .build();
+        parent_db.insert_account(ARBOS_STATE_ADDRESS, AccountInfo::default());
+        bootstrap(
+            &mut parent_db,
+            4663,
+            Address::ZERO,
+            Address::ZERO,
+            U256::from(100_000_000u64),
+            61,
+            SystemBurner::new(None, false),
+        )
+        .unwrap();
+        parent_db.merge_transitions(BundleRetention::PlainState);
+
+        let transaction = TxEip1559 {
+            chain_id: 4663,
+            nonce: 8,
+            gas_limit: 100_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 1,
+            to: TxKind::Call(Address::repeat_byte(0x22)),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: Bytes::new(),
+        };
+        let signature = sign_message(
+            b256!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"),
+            transaction.signature_hash(),
+        )
+        .unwrap();
+        let signed = ArbTransactionSigned::from_envelope(EthereumTxEnvelope::Eip1559(
+            transaction.into_signed(signature),
+        ));
+        let mut l2_msg = vec![arbos::parse_l2::L2_MESSAGE_KIND_SIGNED_TX];
+        l2_msg.extend_from_slice(&signed.encoded_2718());
+
+        let config = ArbEvmConfig::new(Arc::new(ChainSpec::default()));
+        let parent = SequencerBlockState {
+            number: 0,
+            hash: B256::repeat_byte(1),
+            timestamp: 10,
+            mix_hash: arbos::header::compute_arbos_mixhash(0, 5, 61, false),
+            beneficiary: Address::ZERO,
+            delayed_messages_read: 0,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(100_000_000),
+            extra_data: Bytes::from(vec![0; 32]),
+        };
+        let input = SequencerBlockInput {
+            sequence_number: 1,
+            block_hash: B256::repeat_byte(2),
+            kind: 3,
+            sender: Address::ZERO,
+            l1_block_number: 6,
+            l1_timestamp: 11,
+            request_id: None,
+            l1_base_fee: Some(U256::from(1_000_000_000u64)),
+            l2_msg,
+            delayed_messages_read: 0,
+            batch_gas_cost: None,
+            batch_data_stats: None,
+        };
+
+        let error = execute_sequencer_block(&config, parent_db, &parent, &input).unwrap_err();
+        assert!(matches!(
+            error,
+            SequencerExecutionError::Transaction {
+                parsed_index: 0,
+                stage: SequencerTransactionFailureStage::Execution,
+                ref reason,
+            } if reason.contains("nonce mismatch")
+        ));
     }
 
     #[test]

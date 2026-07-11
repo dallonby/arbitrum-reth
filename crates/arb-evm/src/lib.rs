@@ -36,12 +36,13 @@ pub use receipt::ArbReceiptBuilder;
 pub use sequencer::{
     execute_sequencer_block, prewarm_sequencer_recovery_pool, ExecutedSequencerBlock,
     SequencerBlockInput, SequencerBlockState, SequencerExecutionTiming,
-    SequencerTransactionExecution,
+    SequencerTransactionExecution, SequencerTransactionFailureStage,
 };
 pub use simulation::{
-    execute_simulated_batch, execute_simulated_batch_with_inspector, execute_simulated_transaction,
+    execute_simulated_batch, execute_simulated_batch_with_inspector,
+    execute_simulated_signed_block, execute_simulated_transaction,
     execute_simulated_transaction_with_inspector, ArbSimulationBatchOutput,
     ArbSimulationBlockStart, ArbSimulationError, ArbSimulationOutput, ArbSimulationTransaction,
-    ArbSimulationTransactionOutput,
+    ArbSimulationTransactionOutput, ArbSimulationValidation,
 };
 pub use transaction::ArbTransaction;
