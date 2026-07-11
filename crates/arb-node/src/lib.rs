@@ -250,8 +250,11 @@ where
     };
 
     let live_ipc = if rollup_args.live_ipc_enabled {
+        let live_ipc_uds_path = rollup_args.live_ipc_uds_path.as_ref().ok_or_else(|| {
+            eyre::eyre!("--bot-live-exex.uds-path is required when --bot-live-exex.enabled is set")
+        })?;
         let publisher = live_ipc::UdsPublisher::bind(
-            rollup_args.live_ipc_uds_path.clone(),
+            live_ipc_uds_path.clone(),
             rollup_args.live_ipc_queue_capacity,
             rollup_args.live_ipc_client_queue_capacity,
             rollup_args.live_ipc_replay_capacity,
@@ -259,7 +262,7 @@ where
         )?;
         tracing::info!(
             target: "live_ipc",
-            path = %rollup_args.live_ipc_uds_path.display(),
+            path = %live_ipc_uds_path.display(),
             queue_capacity = rollup_args.live_ipc_queue_capacity,
             client_queue_capacity = rollup_args.live_ipc_client_queue_capacity,
             replay_capacity = rollup_args.live_ipc_replay_capacity,
@@ -318,6 +321,10 @@ fn validate_live_ipc_mode(rollup_args: &RollupArgs) -> eyre::Result<()> {
         "--bot-live-exex.enabled requires canonical state roots and cannot be combined with \
          --engine.skip-state-root-validation"
     );
+    eyre::ensure!(
+        !rollup_args.live_ipc_enabled || rollup_args.live_ipc_uds_path.is_some(),
+        "--bot-live-exex.uds-path is required when --bot-live-exex.enabled is set"
+    );
     Ok(())
 }
 
@@ -330,6 +337,7 @@ mod live_ipc_mode_tests {
         let args = RollupArgs {
             live_ipc_enabled: true,
             skip_state_root_validation: true,
+            live_ipc_uds_path: Some("/private/reth/rarbi-live.sock".into()),
             ..Default::default()
         };
         assert!(validate_live_ipc_mode(&args).is_err());
@@ -339,6 +347,7 @@ mod live_ipc_mode_tests {
     fn accepts_each_mode_independently() {
         let canonical_feed = RollupArgs {
             live_ipc_enabled: true,
+            live_ipc_uds_path: Some("/private/reth/rarbi-live.sock".into()),
             ..Default::default()
         };
         assert!(validate_live_ipc_mode(&canonical_feed).is_ok());
@@ -348,6 +357,15 @@ mod live_ipc_mode_tests {
             ..Default::default()
         };
         assert!(validate_live_ipc_mode(&isolated_fast_mode).is_ok());
+    }
+
+    #[test]
+    fn rejects_live_ipc_without_an_explicit_socket_path() {
+        let args = RollupArgs {
+            live_ipc_enabled: true,
+            ..Default::default()
+        };
+        assert!(validate_live_ipc_mode(&args).is_err());
     }
 }
 

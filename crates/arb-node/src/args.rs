@@ -60,12 +60,8 @@ pub struct RollupArgs {
     pub live_ipc_enabled: bool,
 
     /// Unix-domain socket path for the low-latency canonical state-diff feed.
-    #[arg(
-        long = "bot-live-exex.uds-path",
-        env = "BOT_LIVE_EXEX_UDS_PATH",
-        default_value = "/tmp/arbitrum-reth-rarbi-live.sock"
-    )]
-    pub live_ipc_uds_path: PathBuf,
+    #[arg(long = "bot-live-exex.uds-path", env = "BOT_LIVE_EXEX_UDS_PATH")]
+    pub live_ipc_uds_path: Option<PathBuf>,
 
     /// Bounded frame queue between block execution and the UDS dispatcher.
     #[arg(

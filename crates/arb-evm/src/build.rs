@@ -3721,16 +3721,13 @@ fn process_parent_block_hash<DB: arb_storage::StorageBackend>(
     l2_block_number: u64,
     prev_hash: B256,
 ) {
-    use arb_primitives::arbos_versions::HISTORY_STORAGE_ADDRESS;
-
-    /// Arbitrum EIP-2935 buffer size (matching the Arbitrum history storage contract).
-    const HISTORY_SERVE_WINDOW: u64 = 393168;
+    use arb_primitives::arbos_versions::{HISTORY_SERVE_WINDOW_ARBITRUM, HISTORY_STORAGE_ADDRESS};
 
     if l2_block_number == 0 {
         return;
     }
 
-    let slot = U256::from((l2_block_number - 1) % HISTORY_SERVE_WINDOW);
+    let slot = U256::from((l2_block_number - 1) % HISTORY_SERVE_WINDOW_ARBITRUM);
     let value = U256::from_be_slice(prev_hash.as_slice());
 
     arb_storage::StorageBackend::sstore(state, HISTORY_STORAGE_ADDRESS, slot, value)

@@ -11,7 +11,10 @@ use std::{
     fs,
     io::{self, Write},
     net::Shutdown,
-    os::unix::{fs::FileTypeExt, net::UnixListener, net::UnixStream},
+    os::unix::{
+        fs::{FileTypeExt, PermissionsExt},
+        net::{UnixListener, UnixStream},
+    },
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -243,6 +246,8 @@ impl UdsPublisher {
         prepare_socket_path(&path)?;
         let listener = UnixListener::bind(&path)
             .wrap_err_with(|| format!("binding live IPC UDS {}", path.display()))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .wrap_err_with(|| format!("restricting live IPC UDS {}", path.display()))?;
         listener
             .set_nonblocking(true)
             .wrap_err("setting live IPC UDS listener nonblocking")?;
