@@ -1944,7 +1944,7 @@ fn encode_live_canonical_update(
         {
             continue;
         }
-        slots.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        canonicalize_live_slots(&account_change, &mut slots);
         state_changeset.push(LiveAccountChangeFrame {
             address: *address,
             account: account_change,
@@ -1981,6 +1981,19 @@ fn encode_live_canonical_update(
 
     encode_live_ipc_message(&LiveIpcMessage::CanonicalUpdate(update))
         .map_err(|error| BlockProducerError::Execution(format!("encode live IPC update: {error}")))
+}
+
+fn canonicalize_live_slots(
+    account_change: &LiveAccountInfoChangeFrame,
+    slots: &mut Vec<(U256, U256)>,
+) {
+    // Deletion clears the whole account. Per-slot writes are redundant and
+    // would force consumers to decide which representation wins.
+    if matches!(account_change, LiveAccountInfoChangeFrame::Deleted) {
+        slots.clear();
+    } else {
+        slots.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    }
 }
 
 /// Create an internal transaction (type 0x6A).
@@ -2210,5 +2223,12 @@ mod tests {
         assert_eq!(monotonic_l1_block_number(10_538_099, &parent), 10_538_099);
         // Equal stays put.
         assert_eq!(monotonic_l1_block_number(10_538_022, &parent), 10_538_022);
+    }
+
+    #[test]
+    fn live_deleted_account_never_carries_slot_writes() {
+        let mut slots = vec![(U256::from(2), U256::from(3))];
+        canonicalize_live_slots(&LiveAccountInfoChangeFrame::Deleted, &mut slots);
+        assert!(slots.is_empty());
     }
 }
