@@ -104,6 +104,10 @@ pub struct SequencerExecutionTiming {
     pub pre_execution: Duration,
     pub start_block: Duration,
     pub user_transactions: Duration,
+    pub user_preparation: Duration,
+    pub user_evm_execution: Duration,
+    pub user_result_capture: Duration,
+    pub user_commit: Duration,
     pub finish: Duration,
     pub header_derivation: Duration,
     pub bundle_finalization: Duration,
@@ -298,6 +302,10 @@ where
     let start_block = start_block_started.elapsed();
 
     let user_transactions_started = std::time::Instant::now();
+    let mut user_preparation = Duration::ZERO;
+    let mut user_evm_execution = Duration::ZERO;
+    let mut user_result_capture = Duration::ZERO;
+    let mut user_commit = Duration::ZERO;
     for (parsed_index, parsed) in parsed_txs.iter().enumerate() {
         match parsed {
             ParsedTransaction::InternalStartBlock { .. } => continue,
@@ -338,9 +346,11 @@ where
             _ => {}
         }
 
+        let preparation_started = std::time::Instant::now();
         let signed = match parsed_tx_to_signed(parsed, chain_id) {
             Some(tx) => tx,
             None => {
+                user_preparation = user_preparation.saturating_add(preparation_started.elapsed());
                 skipped.push(SkippedSequencerTransaction {
                     parsed_index,
                     reason: "parsed transaction has no signed envelope".into(),
@@ -351,6 +361,7 @@ where
         let recovered = match signed.clone().try_into_recovered() {
             Ok(recovered) => recovered,
             Err(error) => {
+                user_preparation = user_preparation.saturating_add(preparation_started.elapsed());
                 skipped.push(SkippedSequencerTransaction {
                     parsed_index,
                     reason: format!("sender recovery: {error:?}"),
@@ -358,22 +369,34 @@ where
                 continue;
             }
         };
+        user_preparation = user_preparation.saturating_add(preparation_started.elapsed());
 
-        match executor.execute_transaction_without_commit(recovered) {
+        let evm_started = std::time::Instant::now();
+        let execution = executor.execute_transaction_without_commit(recovered);
+        user_evm_execution = user_evm_execution.saturating_add(evm_started.elapsed());
+        match execution {
             Ok(result) => {
+                let capture_started = std::time::Instant::now();
                 user_executions.push(SequencerTransactionExecution {
                     transaction: signed.clone(),
                     result: result.result.result.clone(),
                     state: result.result.state.clone(),
                 });
-                let _ = executor.commit_transaction(result);
                 transactions.push(signed);
+                user_result_capture = user_result_capture.saturating_add(capture_started.elapsed());
+                let commit_started = std::time::Instant::now();
+                let _ = executor.commit_transaction(result);
+                user_commit = user_commit.saturating_add(commit_started.elapsed());
                 drain_scheduled(
                     &mut executor,
                     &mut transactions,
                     &mut user_executions,
                     parsed_index,
                     &mut skipped,
+                    &mut user_preparation,
+                    &mut user_evm_execution,
+                    &mut user_result_capture,
+                    &mut user_commit,
                 );
             }
             Err(error) if error.to_string().contains("block gas limit reached") => break,
@@ -451,6 +474,10 @@ where
             pre_execution,
             start_block,
             user_transactions,
+            user_preparation,
+            user_evm_execution,
+            user_result_capture,
+            user_commit,
             finish,
             header_derivation,
             bundle_finalization,
@@ -494,6 +521,10 @@ fn drain_scheduled<E>(
     user_executions: &mut Vec<SequencerTransactionExecution>,
     parsed_index: usize,
     skipped: &mut Vec<SkippedSequencerTransaction>,
+    user_preparation: &mut Duration,
+    user_evm_execution: &mut Duration,
+    user_result_capture: &mut Duration,
+    user_commit: &mut Duration,
 ) where
     E: BlockExecutor<
             Transaction = ArbTransactionSigned,
@@ -509,7 +540,9 @@ fn drain_scheduled<E>(
             return;
         }
         for encoded in scheduled {
+            let preparation_started = std::time::Instant::now();
             let Some(retry) = ArbTransactionSigned::decode_2718(&mut &encoded[..]).ok() else {
+                *user_preparation = user_preparation.saturating_add(preparation_started.elapsed());
                 skipped.push(SkippedSequencerTransaction {
                     parsed_index,
                     reason: "scheduled retryable decode".into(),
@@ -519,6 +552,8 @@ fn drain_scheduled<E>(
             let recovered = match retry.clone().try_into_recovered() {
                 Ok(recovered) => recovered,
                 Err(error) => {
+                    *user_preparation =
+                        user_preparation.saturating_add(preparation_started.elapsed());
                     skipped.push(SkippedSequencerTransaction {
                         parsed_index,
                         reason: format!("scheduled retryable recovery: {error:?}"),
@@ -526,15 +561,24 @@ fn drain_scheduled<E>(
                     continue;
                 }
             };
-            match executor.execute_transaction_without_commit(recovered) {
+            *user_preparation = user_preparation.saturating_add(preparation_started.elapsed());
+            let evm_started = std::time::Instant::now();
+            let execution = executor.execute_transaction_without_commit(recovered);
+            *user_evm_execution = user_evm_execution.saturating_add(evm_started.elapsed());
+            match execution {
                 Ok(result) => {
+                    let capture_started = std::time::Instant::now();
                     user_executions.push(SequencerTransactionExecution {
                         transaction: retry.clone(),
                         result: result.result.result.clone(),
                         state: result.result.state.clone(),
                     });
-                    let _ = executor.commit_transaction(result);
                     transactions.push(retry);
+                    *user_result_capture =
+                        user_result_capture.saturating_add(capture_started.elapsed());
+                    let commit_started = std::time::Instant::now();
+                    let _ = executor.commit_transaction(result);
+                    *user_commit = user_commit.saturating_add(commit_started.elapsed());
                 }
                 Err(error) => skipped.push(SkippedSequencerTransaction {
                     parsed_index,
