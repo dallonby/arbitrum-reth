@@ -38,7 +38,9 @@ pub use sequencer::{
     SequencerTransactionExecution,
 };
 pub use simulation::{
-    execute_simulated_transaction, execute_simulated_transaction_with_inspector,
-    ArbSimulationError, ArbSimulationOutput, ArbSimulationTransaction,
+    execute_simulated_batch, execute_simulated_batch_with_inspector, execute_simulated_transaction,
+    execute_simulated_transaction_with_inspector, ArbSimulationBatchOutput,
+    ArbSimulationBlockStart, ArbSimulationError, ArbSimulationOutput, ArbSimulationTransaction,
+    ArbSimulationTransactionOutput,
 };
 pub use transaction::ArbTransaction;

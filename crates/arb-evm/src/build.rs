@@ -356,15 +356,54 @@ pub struct ArbBlockExecutor<'a, Evm, Spec, R: ReceiptBuilder> {
     multi_gas_sink: crate::multi_gas::MultiGasSink,
 }
 
-/// Cumulative in-block counters that are not stored in the EVM state trie.
-///
-/// A simulation batch may rebuild the executor between transactions so it can
-/// extract an exact per-transaction bundle. Carrying this value forward keeps
-/// ArbOS's block gas limit and pre-v50 first-user-transaction behavior intact.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Simulation lifecycle and cumulative in-block counters that are not stored
+/// in the EVM state trie.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ArbSimulationProgress {
-    pub block_gas_left: Option<u64>,
-    pub user_txs_processed: u64,
+    /// Whether this target block's pre-execution and StartBlock work has
+    /// already been committed into the simulation state.
+    block_initialized: bool,
+    block_gas_left: Option<u64>,
+    user_txs_processed: u64,
+    recent_wasms: arb_context::RecentWasms,
+    current_gas_backlog: u64,
+    zombie_accounts: rustc_hash::FxHashSet<Address>,
+    finalise_deleted: rustc_hash::FxHashSet<Address>,
+}
+
+impl ArbSimulationProgress {
+    #[cfg(test)]
+    pub(crate) fn initialized(block_gas_left: Option<u64>, user_txs_processed: u64) -> Self {
+        Self {
+            block_initialized: true,
+            block_gas_left,
+            user_txs_processed,
+            ..Default::default()
+        }
+    }
+
+    pub const fn block_initialized(&self) -> bool {
+        self.block_initialized
+    }
+
+    pub const fn block_gas_left(&self) -> Option<u64> {
+        self.block_gas_left
+    }
+
+    pub const fn user_txs_processed(&self) -> u64 {
+        self.user_txs_processed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_recent_wasm(&mut self, hash: B256, capacity: usize) {
+        self.recent_wasms = arb_context::RecentWasms::new(capacity);
+        self.recent_wasms.insert(hash);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_recent_wasm(&self, hash: &B256) -> bool {
+        self.recent_wasms.contains(hash)
+    }
 }
 
 impl<'a, Evm, Spec, R: ReceiptBuilder> ArbBlockExecutor<'a, Evm, Spec, R> {
@@ -393,14 +432,29 @@ impl<'a, Evm, Spec, R: ReceiptBuilder> ArbBlockExecutor<'a, Evm, Spec, R> {
             self.block_gas_left = block_gas_left;
         }
         self.user_txs_processed = progress.user_txs_processed;
+        if progress.block_initialized {
+            self.precompile_ctx
+                .block
+                .restore_recent_wasms(progress.recent_wasms);
+            self.precompile_ctx
+                .block
+                .set_current_gas_backlog(progress.current_gas_backlog);
+            self.zombie_accounts = progress.zombie_accounts;
+            self.finalise_deleted = progress.finalise_deleted;
+        }
     }
 
     /// Capture cumulative counters for the next transaction in a simulation
     /// batch.
     pub fn simulation_progress(&self) -> ArbSimulationProgress {
         ArbSimulationProgress {
+            block_initialized: true,
             block_gas_left: Some(self.block_gas_left),
             user_txs_processed: self.user_txs_processed,
+            recent_wasms: self.precompile_ctx.block.recent_wasms_snapshot(),
+            current_gas_backlog: self.precompile_ctx.block.current_gas_backlog(),
+            zombie_accounts: self.zombie_accounts.clone(),
+            finalise_deleted: self.finalise_deleted.clone(),
         }
     }
 
@@ -1084,7 +1138,7 @@ where
     }
 }
 
-impl<DB, E, Spec, R> BlockExecutor for ArbBlockExecutor<'_, E, Spec, R>
+impl<'a, DB, E, Spec, R> ArbBlockExecutor<'a, E, Spec, R>
 where
     DB: StateDB,
     E: Evm<
@@ -1099,14 +1153,16 @@ where
     R::Transaction: TransactionEnvelope,
     <R::Transaction as TransactionEnvelope>::TxType: Send + 'static,
 {
-    type Transaction = R::Transaction;
-    type Receipt = R::Receipt;
-    type Evm = E;
-    type Result = EthTxResult<E::HaltReason, <R::Transaction as TransactionEnvelope>::TxType>;
+    /// Rehydrate the non-persisted ArbOS executor context for a simulation
+    /// whose block-start writes are already present in its database.
+    pub fn prepare_simulation_continuation(&mut self) -> Result<(), BlockExecutionError> {
+        self.initialize_arbos_execution_context(false)
+    }
 
-    fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
-        self.inner.apply_pre_execution_changes()?;
-
+    fn initialize_arbos_execution_context(
+        &mut self,
+        commit_block_start_fees: bool,
+    ) -> Result<(), BlockExecutionError> {
         // Populate header-derived fields from the EVM block/cfg environment.
         {
             let block = self.inner.evm().block();
@@ -1116,10 +1172,6 @@ where
             }
             self.arb_ctx.coinbase = revm::context::Block::beneficiary(block);
             self.arb_ctx.basefee = U256::from(revm::context::Block::basefee(block));
-            // The block env carries no chain id, so the generic execution path
-            // (e.g. re-execute) leaves it defaulted; the producer sets it via
-            // with_arb_ctx. Source it from the EVM cfg when unset so retryable
-            // auto-redeem tx hashes are correct.
             if self.arb_ctx.chain_id == 0 {
                 self.arb_ctx.chain_id = self.inner.evm().chain_id();
             }
@@ -1131,27 +1183,22 @@ where
             }
         }
 
-        // Ensure L2 block number is set for precompile access.
-        // block_env.number holds L1 block number; L2 comes from the sealed header
-        // (set via arb_context_for_block or with_arb_ctx). If still 0, we're in a
-        // path where it wasn't explicitly set — this shouldn't happen in production.
         if self.arb_ctx.l2_block_number > 0 {
             self.precompile_ctx
                 .block
                 .cache_l1_block_number(self.arb_ctx.l2_block_number, self.arb_ctx.l1_block_number);
         }
 
-        // Load ArbOS state parameters from the EVM database.
-        // Block-start operations (pricing model update, retryable reaping, etc.)
-        // are triggered by the startBlock internal tx, NOT here.
         let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
         let arb_state = arbos_from_input_system(db, SystemBurner::new(None, false))
             .map_err(BlockExecutionError::other)?;
         // SAFETY: see `Storage::state_mut()` invariant. The returned reference
-        // inherits the storage handle's `'a` lifetime, decoupled from `&arb_state`.
+        // inherits the storage handle's lifetime, decoupled from `&arb_state`.
         let state_ref = &mut *db;
 
-        let _ = arb_state.l2_pricing_state.commit_multi_gas_fees(state_ref);
+        if commit_block_start_fees {
+            let _ = arb_state.l2_pricing_state.commit_multi_gas_fees(state_ref);
+        }
 
         if let Ok(base_fee) = arb_state.l2_pricing_state.base_fee_wei(state_ref) {
             self.arb_ctx.basefee = base_fee;
@@ -1181,9 +1228,6 @@ where
         }
         crate::evm::replace_l1_block_hashes(l1_block_hashes);
 
-        // L2 block hashes for arbBlockHash(): parent from the header, deeper
-        // committed ancestors from the state provider. The producer additionally
-        // surfaces unflushed in-memory ancestors via its own header-chain walk.
         {
             let parent_hash = self.arb_ctx.parent_hash;
             let current_l2 = self.arb_ctx.l2_block_number;
@@ -1204,10 +1248,37 @@ where
             basefee = %self.arb_ctx.basefee,
             arbos_version = self.arb_ctx.arbos_version,
             has_hooks = self.arb_hooks.is_some(),
+            commit_block_start_fees,
             "starting block execution"
         );
 
         Ok(())
+    }
+}
+
+impl<DB, E, Spec, R> BlockExecutor for ArbBlockExecutor<'_, E, Spec, R>
+where
+    DB: StateDB,
+    E: Evm<
+        DB = DB,
+        Tx: FromRecoveredTx<R::Transaction> + FromTxWithEncoded<R::Transaction> + ArbTransactionEnv,
+    >,
+    Spec: EthExecutorSpec,
+    R: ReceiptBuilder<
+        Transaction: Transaction + Encodable2718 + ArbTransactionExt,
+        Receipt: TxReceipt<Log = Log> + arb_primitives::SetArbReceiptFields,
+    >,
+    R::Transaction: TransactionEnvelope,
+    <R::Transaction as TransactionEnvelope>::TxType: Send + 'static,
+{
+    type Transaction = R::Transaction;
+    type Receipt = R::Receipt;
+    type Evm = E;
+    type Result = EthTxResult<E::HaltReason, <R::Transaction as TransactionEnvelope>::TxType>;
+
+    fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
+        self.inner.apply_pre_execution_changes()?;
+        self.initialize_arbos_execution_context(true)
     }
 
     fn execute_transaction_without_commit(
@@ -2484,8 +2555,9 @@ where
                         && !log.data.topics().is_empty()
                         && log.data.topics()[0] == l2_to_l1_tx_topic
                     {
-                        // L2ToL1Tx data layout: ABI-encoded [caller, arb_block, eth_block, timestamp,
-                        // callvalue, data] callvalue is at offset 4*32 = 128 bytes.
+                        // L2ToL1Tx data layout: ABI-encoded [caller, arb_block, eth_block,
+                        // timestamp, callvalue, data] callvalue is at
+                        // offset 4*32 = 128 bytes.
                         if log.data.data.len() >= 160 {
                             let callvalue = U256::from_be_slice(&log.data.data[128..160]);
                             withdrawal_value = withdrawal_value.saturating_add(callvalue);

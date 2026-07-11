@@ -17,7 +17,7 @@ use std::{
 };
 
 /// LRU cache of recently invoked Stylus program codehashes.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecentWasms {
     entries: Vec<B256>,
     capacity: usize,
@@ -49,6 +49,10 @@ impl RecentWasms {
             self.entries.remove(0);
         }
         was_present
+    }
+
+    pub fn contains(&self, hash: &B256) -> bool {
+        self.entries.contains(hash)
     }
 }
 
@@ -207,6 +211,14 @@ impl BlockCtx {
 
     pub fn insert_recent_wasm(&self, hash: B256) -> bool {
         self.recent_wasms.lock().insert(hash)
+    }
+
+    pub fn recent_wasms_snapshot(&self) -> RecentWasms {
+        self.recent_wasms.lock().clone()
+    }
+
+    pub fn restore_recent_wasms(&self, recent_wasms: RecentWasms) {
+        *self.recent_wasms.lock() = recent_wasms;
     }
 }
 
