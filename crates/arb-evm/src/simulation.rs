@@ -23,7 +23,7 @@ use alloy_primitives::{keccak256, Address, Bytes, Signature, U256};
 use arb_primitives::{tx_types::ArbInternalTx, ArbTransactionSigned, ArbTypedTransaction};
 use arbos::internal_tx;
 use reth_chainspec::ChainSpec;
-use reth_evm::ConfigureEvm;
+use reth_evm::{ConfigureEvm, EvmEnv};
 use reth_primitives_traits::SignedTransaction;
 use reth_revm::{
     context::result::{ExecutionResult, HaltReason},
@@ -32,6 +32,7 @@ use reth_revm::{
     state::EvmState,
     Database, DatabaseRef,
 };
+use revm::primitives::hardfork::SpecId;
 
 use crate::{
     multi_gas::{MultiGasInspector, MultiGasSink},
@@ -230,18 +231,27 @@ where
     DB: Database<Error = E> + DatabaseRef<Error = E> + std::fmt::Debug,
     E: std::error::Error + Display + Send + Sync + 'static,
 {
-    let mut inspector = NoOpInspector;
-    execute_simulated_transaction_with_inspector(
+    let mut output = execute_simulated_batch(
         evm_config,
         database,
         header,
-        transaction,
+        vec![transaction],
         progress,
         block_start,
         disable_eip3607,
         validation,
-        &mut inspector,
-    )
+    )?;
+    let transaction = output.transactions.pop().ok_or_else(|| {
+        ArbSimulationError::Execution(
+            "single-transaction simulation returned no transaction result".into(),
+        )
+    })??;
+    Ok(ArbSimulationOutput {
+        result: transaction.result,
+        poster_gas: transaction.poster_gas,
+        bundle: output.bundle,
+        progress: output.progress,
+    })
 }
 
 pub fn execute_simulated_transaction_with_inspector<DB, E, I>(
@@ -298,17 +308,16 @@ where
     DB: Database<Error = E> + DatabaseRef<Error = E> + std::fmt::Debug,
     E: std::error::Error + Display + Send + Sync + 'static,
 {
-    let mut inspector = NoOpInspector;
-    execute_simulated_batch_with_inspector(
+    execute_simulated_batch_uninspected_inner(
         evm_config,
         database,
         header,
         transactions,
         progress,
-        block_start,
+        SimulationBlockStart::Synthesized(block_start),
         disable_eip3607,
         validation,
-        &mut inspector,
+        crate::multi_gas::sparse_inspector_enabled(),
     )
 }
 
@@ -388,6 +397,103 @@ where
     E: std::error::Error + Display + Send + Sync + 'static,
     I: for<'a> Inspector<reth_evm::eth::EthEvmContext<&'a mut State<DB>>>,
 {
+    let (mut state, evm_env) = prepare_simulation_state(
+        evm_config,
+        database,
+        header,
+        &progress,
+        block_start,
+        disable_eip3607,
+        validation,
+    )?;
+    let multi_gas_sink = MultiGasSink::default();
+    let multi_gas_inspector = MultiGasInspector::with_sink(multi_gas_sink.clone());
+    let evm_factory = evm_config.block_executor_factory().evm_factory();
+
+    // Inspected diagnostics require revm's generic dispatch so both the caller
+    // and the consensus multi-gas inspector receive every hook.
+    let evm = evm_factory.create_evm_with_inspector(
+        &mut state,
+        evm_env,
+        (inspector, multi_gas_inspector),
+    );
+    let metadata = run_batch_executor(
+        evm_config,
+        evm,
+        header,
+        transactions,
+        progress,
+        block_start,
+        validation,
+        multi_gas_sink,
+    )?;
+
+    finalize_simulation_state(&mut state, metadata)
+}
+
+fn execute_simulated_batch_uninspected_inner<DB, E>(
+    evm_config: &ArbEvmConfig<ChainSpec>,
+    database: DB,
+    header: &Header,
+    transactions: Vec<ArbSimulationTransaction>,
+    progress: ArbSimulationProgress,
+    block_start: SimulationBlockStart,
+    disable_eip3607: bool,
+    validation: ArbSimulationValidation,
+    sparse_multigas: bool,
+) -> Result<ArbSimulationBatchOutput, ArbSimulationError>
+where
+    DB: Database<Error = E> + DatabaseRef<Error = E> + std::fmt::Debug,
+    E: std::error::Error + Display + Send + Sync + 'static,
+{
+    let (mut state, evm_env) = prepare_simulation_state(
+        evm_config,
+        database,
+        header,
+        &progress,
+        block_start,
+        disable_eip3607,
+        validation,
+    )?;
+    let multi_gas_sink = MultiGasSink::default();
+    let multi_gas_inspector = MultiGasInspector::with_sink(multi_gas_sink.clone());
+    let evm_factory = evm_config.block_executor_factory().evm_factory();
+    let evm = if sparse_multigas {
+        evm_factory.create_evm_with_sparse_multigas_inspector(
+            &mut state,
+            evm_env,
+            multi_gas_inspector,
+        )
+    } else {
+        evm_factory.create_evm_with_inspector(&mut state, evm_env, multi_gas_inspector)
+    };
+    let metadata = run_batch_executor(
+        evm_config,
+        evm,
+        header,
+        transactions,
+        progress,
+        block_start,
+        validation,
+        multi_gas_sink,
+    )?;
+
+    finalize_simulation_state(&mut state, metadata)
+}
+
+fn prepare_simulation_state<DB, E>(
+    evm_config: &ArbEvmConfig<ChainSpec>,
+    database: DB,
+    header: &Header,
+    progress: &ArbSimulationProgress,
+    block_start: SimulationBlockStart,
+    disable_eip3607: bool,
+    validation: ArbSimulationValidation,
+) -> Result<(State<DB>, EvmEnv<SpecId>), ArbSimulationError>
+where
+    DB: Database<Error = E> + DatabaseRef<Error = E> + std::fmt::Debug,
+    E: std::error::Error + Display + Send + Sync + 'static,
+{
     if !progress.block_initialized() {
         if let SimulationBlockStart::Synthesized(block_start) = block_start {
             let start = block_start.ok_or_else(|| {
@@ -413,34 +519,21 @@ where
     evm_env.cfg_env.disable_fee_charge = validation.disable_fee_charging;
     evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
 
-    let mut state = StateBuilder::new()
+    let state = StateBuilder::new()
         .with_database(database)
         .with_bundle_update()
         .build();
-    let multi_gas_sink = MultiGasSink::default();
-    let multi_gas_inspector = MultiGasInspector::with_sink(multi_gas_sink.clone());
-    let evm_factory = evm_config.block_executor_factory().evm_factory();
+    Ok((state, evm_env))
+}
 
-    // A user inspector requires revm's generic dispatch so both it and the
-    // consensus multi-gas inspector receive every hook. The sparse path is an
-    // experimental node optimization and remains irrelevant to inspected
-    // diagnostics.
-    let evm = evm_factory.create_evm_with_inspector(
-        &mut state,
-        evm_env,
-        (inspector, multi_gas_inspector),
-    );
-    let metadata = run_batch_executor(
-        evm_config,
-        evm,
-        header,
-        transactions,
-        progress,
-        block_start,
-        validation,
-        multi_gas_sink,
-    )?;
-
+fn finalize_simulation_state<DB, E>(
+    state: &mut State<DB>,
+    metadata: ExecutorMetadata,
+) -> Result<ArbSimulationBatchOutput, ArbSimulationError>
+where
+    DB: Database<Error = E> + DatabaseRef<Error = E> + std::fmt::Debug,
+    E: std::error::Error + Display + Send + Sync + 'static,
+{
     state.merge_transitions(BundleRetention::Reverts);
     let mut bundle = state.take_bundle();
     augment_bundle_from_cache(&mut bundle, &state.cache, &state.database)
@@ -1085,6 +1178,56 @@ mod tests {
         );
         assert!(output.progress.block_gas_left().unwrap() < 1_000_000);
         assert_eq!(output.progress.user_txs_processed(), 8);
+    }
+
+    #[test]
+    fn sparse_uninspected_simulation_matches_generic_execution() {
+        let transaction = |nonce, to, value| {
+            ArbSimulationTransaction::from_signed(
+                signed_1559(nonce, to, U256::from(value), Bytes::new())
+                    .try_into_recovered()
+                    .unwrap(),
+            )
+        };
+        let run = |sparse_multigas| {
+            execute_simulated_batch_uninspected_inner(
+                &config(),
+                database(),
+                &header(),
+                vec![
+                    transaction(0, FEE_CONTEXT_CONTRACT, 0),
+                    transaction(1, RECIPIENT, 123_456),
+                ],
+                ArbSimulationProgress::default(),
+                SimulationBlockStart::Synthesized(Some(ArbSimulationBlockStart {
+                    l1_base_fee: U256::from(1_000_000_000u64),
+                    l1_block_number: 9,
+                    time_passed: 0,
+                })),
+                false,
+                ArbSimulationValidation::strict(),
+                sparse_multigas,
+            )
+            .unwrap()
+        };
+
+        let generic = run(false);
+        let sparse = run(true);
+        assert_eq!(generic.transactions.len(), sparse.transactions.len());
+        for (generic, sparse) in generic.transactions.iter().zip(&sparse.transactions) {
+            let generic = generic.as_ref().unwrap();
+            let sparse = sparse.as_ref().unwrap();
+            assert_eq!(generic.result, sparse.result);
+            assert_eq!(generic.poster_gas, sparse.poster_gas);
+            assert_eq!(generic.state, sparse.state);
+        }
+        assert_eq!(generic.progress, sparse.progress);
+
+        let mut generic_state = database();
+        apply_bundle(&mut generic_state, &generic.bundle);
+        let mut sparse_state = database();
+        apply_bundle(&mut sparse_state, &sparse.bundle);
+        assert_same_cached_state(&generic_state, &sparse_state);
     }
 
     #[test]
