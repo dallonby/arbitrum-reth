@@ -74,18 +74,26 @@ fn non_computation(kind: OpKind) -> MultiGas {
             present,
             new,
         } => {
-            let mut pairs = Vec::with_capacity(2);
-            if cold {
-                pairs.push((StorageAccessRead, COLD_SLOAD));
-            }
-            if present != new && original == present {
-                if original.is_zero() {
-                    pairs.push((StorageGrowth, SSTORE_SET));
-                } else {
-                    pairs.push((StorageAccessWrite, SSTORE_RESET_WRITE));
-                }
-            }
-            MultiGas::from_pairs(&pairs)
+            let clean_write = present != new && original == present;
+            MultiGas::from_pairs(&[
+                (StorageAccessRead, if cold { COLD_SLOAD } else { 0 }),
+                (
+                    StorageAccessWrite,
+                    if clean_write && !original.is_zero() {
+                        SSTORE_RESET_WRITE
+                    } else {
+                        0
+                    },
+                ),
+                (
+                    StorageGrowth,
+                    if clean_write && original.is_zero() {
+                        SSTORE_SET
+                    } else {
+                        0
+                    },
+                ),
+            ])
         }
         OpKind::AccountAccess { cold } => {
             MultiGas::storage_access_read_gas(if cold { COLD_ACCOUNT - WARM } else { 0 })
@@ -97,26 +105,18 @@ fn non_computation(kind: OpKind) -> MultiGas {
         OpKind::Log { topics, data_len } => {
             MultiGas::history_growth_gas(LOG_TOPIC_HISTORY * topics as u64 + LOG_DATA * data_len)
         }
-        OpKind::Call { cold, new_account } => {
-            let mut pairs = Vec::with_capacity(2);
-            if cold {
-                pairs.push((StorageAccessRead, COLD_ACCOUNT - WARM));
-            }
-            if new_account {
-                pairs.push((StorageGrowth, NEW_ACCOUNT));
-            }
-            MultiGas::from_pairs(&pairs)
-        }
-        OpKind::SelfDestruct { cold, new_account } => {
-            let mut pairs = vec![(StorageAccessWrite, SELFDESTRUCT_BASE_WRITE)];
-            if cold {
-                pairs.push((StorageAccessRead, COLD_ACCOUNT));
-            }
-            if new_account {
-                pairs.push((StorageGrowth, NEW_ACCOUNT));
-            }
-            MultiGas::from_pairs(&pairs)
-        }
+        OpKind::Call { cold, new_account } => MultiGas::from_pairs(&[
+            (
+                StorageAccessRead,
+                if cold { COLD_ACCOUNT - WARM } else { 0 },
+            ),
+            (StorageGrowth, if new_account { NEW_ACCOUNT } else { 0 }),
+        ]),
+        OpKind::SelfDestruct { cold, new_account } => MultiGas::from_pairs(&[
+            (StorageAccessWrite, SELFDESTRUCT_BASE_WRITE),
+            (StorageAccessRead, if cold { COLD_ACCOUNT } else { 0 }),
+            (StorageGrowth, if new_account { NEW_ACCOUNT } else { 0 }),
+        ]),
         OpKind::Other => MultiGas::zero(),
     }
 }
