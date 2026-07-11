@@ -7,9 +7,9 @@
 //! error or publish it to an in-memory overlay after the complete message has
 //! succeeded.
 
-use std::{fmt::Display, time::Duration};
+use std::{fmt::Display, sync::LazyLock, time::Duration};
 
-use alloy_consensus::Header;
+use alloy_consensus::{transaction::Recovered, Header};
 use alloy_eips::eip2718::Decodable2718;
 use alloy_evm::{
     block::{BlockExecutor, BlockExecutorFactory},
@@ -27,6 +27,7 @@ use arbos::{
     internal_tx,
     parse_l2::{parse_l2_transactions, parsed_tx_to_signed, ParsedTransaction},
 };
+use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
 use reth_chainspec::ChainSpec;
 use reth_evm::ConfigureEvm;
 use reth_primitives_traits::SignedTransaction;
@@ -139,6 +140,70 @@ pub struct SequencerTransactionExecution {
     pub transaction: ArbTransactionSigned,
     pub result: reth_revm::context::result::ExecutionResult<reth_revm::context::result::HaltReason>,
     pub state: reth_revm::state::EvmState,
+}
+
+type PreparedSequencerTransaction =
+    Option<Result<(ArbTransactionSigned, Recovered<ArbTransactionSigned>), String>>;
+
+const RECOVERY_CHUNK_SIZE: usize = 8;
+
+static SEQUENCER_RECOVERY_POOL: LazyLock<Option<ThreadPool>> = LazyLock::new(|| {
+    let threads = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(4);
+    if threads < 2 {
+        return None;
+    }
+    match ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|index| format!("arb-sequencer-recovery-{index}"))
+        .build()
+    {
+        Ok(pool) => Some(pool),
+        Err(error) => {
+            tracing::warn!(%error, "failed to build sequencer recovery pool; using serial recovery");
+            None
+        }
+    }
+});
+
+/// Initialize the bounded signature-recovery pool before sequencer ingress.
+pub fn prewarm_sequencer_recovery_pool() {
+    let _ = SEQUENCER_RECOVERY_POOL.as_ref();
+}
+
+fn prepare_sequencer_chunk(
+    parsed_txs: &[ParsedTransaction],
+    chain_id: u64,
+) -> Vec<PreparedSequencerTransaction> {
+    let prepare = |parsed: &ParsedTransaction| -> PreparedSequencerTransaction {
+        if matches!(
+            parsed,
+            ParsedTransaction::InternalStartBlock { .. }
+                | ParsedTransaction::BatchPostingReport { .. }
+        ) {
+            return None;
+        }
+        let signed = match parsed_tx_to_signed(parsed, chain_id) {
+            Some(signed) => signed,
+            None => return Some(Err("parsed transaction has no signed envelope".into())),
+        };
+        Some(
+            signed
+                .clone()
+                .try_into_recovered()
+                .map(|recovered| (signed, recovered))
+                .map_err(|error| format!("sender recovery: {error:?}")),
+        )
+    };
+
+    if parsed_txs.len() >= 4 {
+        if let Some(pool) = SEQUENCER_RECOVERY_POOL.as_ref() {
+            return pool.install(|| parsed_txs.par_iter().map(prepare).collect());
+        }
+    }
+    parsed_txs.iter().map(prepare).collect()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -306,104 +371,110 @@ where
     let mut user_evm_execution = Duration::ZERO;
     let mut user_result_capture = Duration::ZERO;
     let mut user_commit = Duration::ZERO;
-    for (parsed_index, parsed) in parsed_txs.iter().enumerate() {
-        match parsed {
-            ParsedTransaction::InternalStartBlock { .. } => continue,
-            ParsedTransaction::BatchPostingReport {
-                batch_timestamp,
-                batch_poster,
-                batch_number,
-                l1_base_fee_estimate,
-                extra_gas,
-                ..
-            } => {
-                let report_data =
-                    if parent_arbos_version >= arb_chainspec::arbos_version::ARBOS_VERSION_50 {
-                        let (length, non_zeros) = input.batch_data_stats.unwrap_or((0, 0));
-                        internal_tx::encode_batch_posting_report_v2(
-                            *batch_timestamp,
-                            *batch_poster,
-                            *batch_number,
-                            length,
-                            non_zeros,
-                            *extra_gas,
-                            *l1_base_fee_estimate,
-                        )
-                    } else {
-                        internal_tx::encode_batch_posting_report(
-                            *batch_timestamp,
-                            *batch_poster,
-                            *batch_number,
-                            input.batch_gas_cost.unwrap_or(0).saturating_add(*extra_gas),
-                            *l1_base_fee_estimate,
-                        )
-                    };
-                let report_tx = create_internal_tx(chain_id, &report_data);
-                execute_and_commit(&mut executor, &report_tx, "BatchPostingReport")?;
-                transactions.push(report_tx);
-                continue;
-            }
-            _ => {}
-        }
-
+    'transactions: for (chunk_index, parsed_chunk) in
+        parsed_txs.chunks(RECOVERY_CHUNK_SIZE).enumerate()
+    {
         let preparation_started = std::time::Instant::now();
-        let signed = match parsed_tx_to_signed(parsed, chain_id) {
-            Some(tx) => tx,
-            None => {
-                user_preparation = user_preparation.saturating_add(preparation_started.elapsed());
-                skipped.push(SkippedSequencerTransaction {
-                    parsed_index,
-                    reason: "parsed transaction has no signed envelope".into(),
-                });
-                continue;
-            }
-        };
-        let recovered = match signed.clone().try_into_recovered() {
-            Ok(recovered) => recovered,
-            Err(error) => {
-                user_preparation = user_preparation.saturating_add(preparation_started.elapsed());
-                skipped.push(SkippedSequencerTransaction {
-                    parsed_index,
-                    reason: format!("sender recovery: {error:?}"),
-                });
-                continue;
-            }
-        };
+        let prepared_chunk = prepare_sequencer_chunk(parsed_chunk, chain_id);
         user_preparation = user_preparation.saturating_add(preparation_started.elapsed());
-
-        let evm_started = std::time::Instant::now();
-        let execution = executor.execute_transaction_without_commit(recovered);
-        user_evm_execution = user_evm_execution.saturating_add(evm_started.elapsed());
-        match execution {
-            Ok(result) => {
-                let capture_started = std::time::Instant::now();
-                user_executions.push(SequencerTransactionExecution {
-                    transaction: signed.clone(),
-                    result: result.result.result.clone(),
-                    state: result.result.state.clone(),
-                });
-                transactions.push(signed);
-                user_result_capture = user_result_capture.saturating_add(capture_started.elapsed());
-                let commit_started = std::time::Instant::now();
-                let _ = executor.commit_transaction(result);
-                user_commit = user_commit.saturating_add(commit_started.elapsed());
-                drain_scheduled(
-                    &mut executor,
-                    &mut transactions,
-                    &mut user_executions,
-                    parsed_index,
-                    &mut skipped,
-                    &mut user_preparation,
-                    &mut user_evm_execution,
-                    &mut user_result_capture,
-                    &mut user_commit,
-                );
+        for (chunk_offset, (parsed, prepared)) in
+            parsed_chunk.iter().zip(prepared_chunk).enumerate()
+        {
+            let parsed_index = chunk_index * RECOVERY_CHUNK_SIZE + chunk_offset;
+            match parsed {
+                ParsedTransaction::InternalStartBlock { .. } => continue,
+                ParsedTransaction::BatchPostingReport {
+                    batch_timestamp,
+                    batch_poster,
+                    batch_number,
+                    l1_base_fee_estimate,
+                    extra_gas,
+                    ..
+                } => {
+                    let report_data =
+                        if parent_arbos_version >= arb_chainspec::arbos_version::ARBOS_VERSION_50 {
+                            let (length, non_zeros) = input.batch_data_stats.unwrap_or((0, 0));
+                            internal_tx::encode_batch_posting_report_v2(
+                                *batch_timestamp,
+                                *batch_poster,
+                                *batch_number,
+                                length,
+                                non_zeros,
+                                *extra_gas,
+                                *l1_base_fee_estimate,
+                            )
+                        } else {
+                            internal_tx::encode_batch_posting_report(
+                                *batch_timestamp,
+                                *batch_poster,
+                                *batch_number,
+                                input.batch_gas_cost.unwrap_or(0).saturating_add(*extra_gas),
+                                *l1_base_fee_estimate,
+                            )
+                        };
+                    let report_tx = create_internal_tx(chain_id, &report_data);
+                    execute_and_commit(&mut executor, &report_tx, "BatchPostingReport")?;
+                    transactions.push(report_tx);
+                    continue;
+                }
+                _ => {}
             }
-            Err(error) if error.to_string().contains("block gas limit reached") => break,
-            Err(error) => skipped.push(SkippedSequencerTransaction {
-                parsed_index,
-                reason: format!("execution: {error}"),
-            }),
+
+            let (signed, recovered) = match prepared {
+                Some(Ok(prepared)) => prepared,
+                Some(Err(reason)) => {
+                    skipped.push(SkippedSequencerTransaction {
+                        parsed_index,
+                        reason,
+                    });
+                    continue;
+                }
+                None => {
+                    skipped.push(SkippedSequencerTransaction {
+                        parsed_index,
+                        reason: "user transaction preparation was unavailable".into(),
+                    });
+                    continue;
+                }
+            };
+
+            let evm_started = std::time::Instant::now();
+            let execution = executor.execute_transaction_without_commit(recovered);
+            user_evm_execution = user_evm_execution.saturating_add(evm_started.elapsed());
+            match execution {
+                Ok(result) => {
+                    let capture_started = std::time::Instant::now();
+                    user_executions.push(SequencerTransactionExecution {
+                        transaction: signed.clone(),
+                        result: result.result.result.clone(),
+                        state: result.result.state.clone(),
+                    });
+                    transactions.push(signed);
+                    user_result_capture =
+                        user_result_capture.saturating_add(capture_started.elapsed());
+                    let commit_started = std::time::Instant::now();
+                    let _ = executor.commit_transaction(result);
+                    user_commit = user_commit.saturating_add(commit_started.elapsed());
+                    drain_scheduled(
+                        &mut executor,
+                        &mut transactions,
+                        &mut user_executions,
+                        parsed_index,
+                        &mut skipped,
+                        &mut user_preparation,
+                        &mut user_evm_execution,
+                        &mut user_result_capture,
+                        &mut user_commit,
+                    );
+                }
+                Err(error) if error.to_string().contains("block gas limit reached") => {
+                    break 'transactions
+                }
+                Err(error) => skipped.push(SkippedSequencerTransaction {
+                    parsed_index,
+                    reason: format!("execution: {error}"),
+                }),
+            }
         }
     }
     let user_transactions = user_transactions_started.elapsed();

@@ -1179,6 +1179,7 @@ dependencies = [
  "arb-test-utils",
  "arbos",
  "parking_lot",
+ "rayon",
  "reth-chainspec",
  "reth-ethereum-primitives",
  "reth-evm",
