@@ -35,7 +35,7 @@ pub use hooks::{ArbOsHooks, NoopArbOsHooks};
 pub use receipt::ArbReceiptBuilder;
 pub use sequencer::{
     execute_sequencer_block, ExecutedSequencerBlock, SequencerBlockInput, SequencerBlockState,
-    SequencerTransactionExecution,
+    SequencerExecutionTiming, SequencerTransactionExecution,
 };
 pub use simulation::{
     execute_simulated_batch, execute_simulated_batch_with_inspector, execute_simulated_transaction,

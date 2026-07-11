@@ -7,7 +7,7 @@
 //! error or publish it to an in-memory overlay after the complete message has
 //! succeeded.
 
-use std::fmt::Display;
+use std::{fmt::Display, time::Duration};
 
 use alloy_consensus::Header;
 use alloy_eips::eip2718::Decodable2718;
@@ -97,6 +97,19 @@ pub struct SkippedSequencerTransaction {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SequencerExecutionTiming {
+    pub parse: Duration,
+    pub setup: Duration,
+    pub pre_execution: Duration,
+    pub start_block: Duration,
+    pub user_transactions: Duration,
+    pub finish: Duration,
+    pub header_derivation: Duration,
+    pub bundle_finalization: Duration,
+    pub total: Duration,
+}
+
 /// Atomic output of one complete sequencer-message execution.
 #[derive(Debug)]
 pub struct ExecutedSequencerBlock {
@@ -114,6 +127,7 @@ pub struct ExecutedSequencerBlock {
     /// consumer must resume these counters rather than starting a fresh block.
     pub simulation_progress: ArbSimulationProgress,
     pub skipped: Vec<SkippedSequencerTransaction>,
+    pub timing: SequencerExecutionTiming,
 }
 
 #[derive(Debug)]
@@ -153,6 +167,7 @@ where
     DB: Database<Error = E> + DatabaseRef<Error = E> + std::fmt::Debug,
     E: std::error::Error + Display + Send + Sync + 'static,
 {
+    let execution_started = std::time::Instant::now();
     let l2_block_number = parent.number.saturating_add(1);
     if input.sequence_number != l2_block_number {
         return Err(SequencerExecutionError::Continuity {
@@ -161,6 +176,7 @@ where
         });
     }
 
+    let parse_started = std::time::Instant::now();
     let chain_id = evm_config.chain_spec().chain().id();
     let parsed_txs = parse_l2_transactions(
         input.kind,
@@ -171,7 +187,9 @@ where
         chain_id,
     )
     .map_err(|error| SequencerExecutionError::Parse(error.to_string()))?;
+    let parse = parse_started.elapsed();
 
+    let setup_started = std::time::Instant::now();
     let timestamp = input.l1_timestamp.max(parent.timestamp);
     let time_passed = timestamp.saturating_sub(parent.timestamp);
     let parent_arbos_version = extract_arbos_version_from_mix_hash(parent.mix_hash);
@@ -246,6 +264,8 @@ where
     executor.set_multi_gas_sink(multi_gas_sink);
     executor.arb_ctx.l2_block_number = l2_block_number;
     executor.arb_ctx.l1_block_number = block_l1_block_number;
+    let setup = setup_started.elapsed();
+    let pre_execution_started = std::time::Instant::now();
     executor
         .apply_pre_execution_changes()
         .map_err(|error| SequencerExecutionError::Execution(format!("pre-exec: {error}")))?;
@@ -259,6 +279,7 @@ where
         .precompile_ctx
         .block
         .cache_l2_block_hash(parent.number, parent.hash);
+    let pre_execution = pre_execution_started.elapsed();
 
     let mut transactions = Vec::with_capacity(parsed_txs.len().saturating_add(1));
     let mut user_executions = Vec::with_capacity(parsed_txs.len());
@@ -271,9 +292,12 @@ where
         time_passed,
     );
     let start_block = create_internal_tx(chain_id, &start_block_data);
+    let start_block_started = std::time::Instant::now();
     execute_and_commit(&mut executor, &start_block, "StartBlock")?;
     transactions.push(start_block);
+    let start_block = start_block_started.elapsed();
 
+    let user_transactions_started = std::time::Instant::now();
     for (parsed_index, parsed) in parsed_txs.iter().enumerate() {
         match parsed {
             ParsedTransaction::InternalStartBlock { .. } => continue,
@@ -359,14 +383,18 @@ where
             }),
         }
     }
+    let user_transactions = user_transactions_started.elapsed();
 
+    let finish_started = std::time::Instant::now();
     let simulation_progress = executor.simulation_progress();
     let zombie_accounts = executor.zombie_accounts();
     let finalise_deleted = executor.finalise_deleted().clone();
     let (_, execution_result) = executor
         .finish()
         .map_err(|error| SequencerExecutionError::Execution(format!("finish: {error}")))?;
+    let finish = finish_started.elapsed();
 
+    let header_derivation_started = std::time::Instant::now();
     let read_post_slot = |address: Address, slot: B256| {
         state
             .storage_ref(address, U256::from_be_bytes(slot.0))
@@ -374,7 +402,9 @@ where
     };
     let header_info = derive_arb_header_info(&read_post_slot, input.sender)
         .map_err(|error| SequencerExecutionError::State(error.to_string()))?;
+    let header_derivation = header_derivation_started.elapsed();
 
+    let bundle_finalization_started = std::time::Instant::now();
     state.merge_transitions(BundleRetention::Reverts);
     let mut bundle = state.take_bundle();
     augment_bundle_from_cache(&mut bundle, &state.cache, &state.database)?;
@@ -393,6 +423,8 @@ where
         ),
         None => (provisional_mix_hash, parent.extra_data.clone()),
     };
+    let bundle_finalization = bundle_finalization_started.elapsed();
+    let total = execution_started.elapsed();
 
     Ok(ExecutedSequencerBlock {
         state: SequencerBlockState {
@@ -413,6 +445,17 @@ where
         gas_used: execution_result.gas_used,
         simulation_progress,
         skipped,
+        timing: SequencerExecutionTiming {
+            parse,
+            setup,
+            pre_execution,
+            start_block,
+            user_transactions,
+            finish,
+            header_derivation,
+            bundle_finalization,
+            total,
+        },
     })
 }
 
