@@ -3,8 +3,10 @@
 //! Signed transactions retain their exact poster-cost bytes. Unsigned optimizer
 //! probes use a deterministic synthetic envelope and are estimates. Both paths
 //! share one `ArbBlockExecutor` per batch, including StartBlock when requested,
-//! poster fees, multi-gas accounting, scheduled retryables, fee routing, and
-//! per-transaction finalisation.
+//! poster-cost and multi-gas calculation, scheduled retryables, and
+//! per-transaction finalisation. Signed execution applies canonical fee/nonce
+//! state; relaxed unsigned execution deliberately suppresses those synthetic
+//! state writes while preserving execution-visible fee inputs and gas results.
 
 use std::fmt::Display;
 
@@ -148,13 +150,18 @@ pub struct ArbSimulationBlockStart {
     pub time_passed: u64,
 }
 
-/// Manual ArbOS validation checks that unsigned speculative calls may relax.
+/// Simulation policy for speculative ArbOS transactions.
+///
+/// Unsigned optimizer calls may relax transaction validation and suppress
+/// synthetic fee/nonce bookkeeping while retaining the target block's
+/// `BASEFEE`, the transaction's effective `GASPRICE`, and full gas accounting.
 /// Exact signed and canonical execution must use [`Self::strict`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ArbSimulationValidation {
     pub disable_nonce_check: bool,
     pub disable_base_fee_check: bool,
     pub disable_balance_check: bool,
+    pub disable_fee_charging: bool,
 }
 
 impl ArbSimulationValidation {
@@ -163,6 +170,7 @@ impl ArbSimulationValidation {
             disable_nonce_check: false,
             disable_base_fee_check: false,
             disable_balance_check: false,
+            disable_fee_charging: false,
         }
     }
 
@@ -171,6 +179,7 @@ impl ArbSimulationValidation {
             disable_nonce_check: true,
             disable_base_fee_check: true,
             disable_balance_check: true,
+            disable_fee_charging: true,
         }
     }
 }
@@ -382,9 +391,9 @@ where
                 )
             })?;
             let header_l1_block = crate::config::l1_block_number_from_mix_hash(&header.mix_hash);
-            if start.l1_block_number != header_l1_block {
+            if start.l1_block_number > header_l1_block {
                 return Err(ArbSimulationError::Execution(format!(
-                    "StartBlock L1 number {} does not match header mix-hash L1 number {header_l1_block}",
+                    "reported StartBlock L1 number {} exceeds monotonic header mix-hash L1 number {header_l1_block}",
                     start.l1_block_number
                 )));
             }
@@ -396,6 +405,7 @@ where
         .map_err(|error| ArbSimulationError::Execution(error.to_string()))?;
     evm_env.cfg_env.disable_eip3607 = disable_eip3607;
     evm_env.cfg_env.disable_nonce_check = validation.disable_nonce_check;
+    evm_env.cfg_env.disable_fee_charge = validation.disable_fee_charging;
     evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
 
     let mut state = StateBuilder::new()
@@ -477,9 +487,9 @@ fn validate_included_start_block(
         ArbSimulationError::Execution(format!("decode exact signed StartBlock: {error}"))
     })?;
     let header_l1_block = crate::config::l1_block_number_from_mix_hash(&header.mix_hash);
-    if start.l1_block_number != header_l1_block {
+    if start.l1_block_number > header_l1_block {
         return Err(ArbSimulationError::Execution(format!(
-            "signed StartBlock L1 number {} does not match header mix-hash L1 number {header_l1_block}",
+            "reported signed StartBlock L1 number {} exceeds monotonic header mix-hash L1 number {header_l1_block}",
             start.l1_block_number
         )));
     }
@@ -543,7 +553,18 @@ where
         validation.disable_nonce_check,
         validation.disable_base_fee_check,
         validation.disable_balance_check,
+        validation.disable_fee_charging,
     );
+    let header_l1_block = crate::config::l1_block_number_from_mix_hash(&header.mix_hash);
+    let validate_monotonic_l1 = |actual: u64| {
+        if actual == header_l1_block {
+            Ok(())
+        } else {
+            Err(ArbSimulationError::Execution(format!(
+                "executed StartBlock L1 number {actual} does not match monotonic header mix-hash L1 number {header_l1_block}"
+            )))
+        }
+    };
     if progress.block_initialized() {
         executor
             .prepare_simulation_continuation()
@@ -554,6 +575,7 @@ where
             .map_err(|error| ArbSimulationError::Execution(error.to_string()))?;
         if let SimulationBlockStart::Synthesized(Some(block_start)) = block_start {
             execute_start_block(&mut executor, chain_id, header.number, block_start)?;
+            validate_monotonic_l1(executor.arb_ctx.l1_block_number)?;
         }
     }
     executor.set_simulation_progress(progress);
@@ -567,6 +589,9 @@ where
                 let state = output.result.state.clone();
                 let _ = executor.commit_transaction(output);
                 drain_scheduled_transactions(&mut executor)?;
+                if index == 0 && matches!(block_start, SimulationBlockStart::Included) {
+                    validate_monotonic_l1(executor.arb_ctx.l1_block_number)?;
+                }
                 transaction_outputs.push(Ok(ArbSimulationTransactionOutput { result, state }));
             }
             Err(error) if error.as_validation().is_some() => {
@@ -696,6 +721,7 @@ mod tests {
         b256!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
     const RECIPIENT: Address = address!("000000000000000000000000000000000000b0b0");
     const L1_NUMBER_CONTRACT: Address = address!("0000000000000000000000000000000000000043");
+    const FEE_CONTEXT_CONTRACT: Address = address!("0000000000000000000000000000000000000048");
     const STYLUS_PROGRAM: Address = address!("2dc1bad4e0a3af9acf003d65dea54dc568e787d2");
     const STYLUS_PROGRAM_HEX: &str = include_str!(concat!(
         "../../arb-spec-tests/fixtures/regression/stylus_nested_oog/program.hex"
@@ -737,6 +763,39 @@ mod tests {
                 ..Default::default()
             },
         );
+        // Write 42 to slot zero, then return BASEFEE || GASPRICE.
+        let code = Bytecode::new_raw(Bytes::from_static(&[
+            0x60, 0x2a, 0x60, 0x00, 0x55, 0x48, 0x60, 0x00, 0x52, 0x3a, 0x60, 0x20, 0x52, 0x60,
+            0x40, 0x60, 0x00, 0xf3,
+        ]));
+        database.insert_account(
+            FEE_CONTEXT_CONTRACT,
+            AccountInfo {
+                code_hash: code.hash_slow(),
+                code: Some(code),
+                ..Default::default()
+            },
+        );
+        database.merge_transitions(BundleRetention::PlainState);
+        database
+    }
+
+    fn database_with_l1_number(l1_block_number: u64) -> TestDb {
+        let mut database = database();
+        let arb_state =
+            arbos::arbos_state::ArbosState::open(&mut database, SystemBurner::new(None, false))
+                .unwrap();
+        // SAFETY: the detached test state has no concurrent borrower.
+        let backend = unsafe { arb_state.backing_storage.state_mut() };
+        arb_state
+            .blockhashes
+            .record_new_l1_block(
+                backend,
+                l1_block_number.saturating_sub(1),
+                B256::repeat_byte(0x77),
+                61,
+            )
+            .unwrap();
         database.merge_transitions(BundleRetention::PlainState);
         database
     }
@@ -1165,6 +1224,68 @@ mod tests {
     }
 
     #[test]
+    fn exact_and_synthesized_startblock_allow_reported_l1_regression() {
+        let block_start = ArbSimulationBlockStart {
+            l1_base_fee: U256::from(1_000_000_000u64),
+            l1_block_number: 8,
+            time_passed: 0,
+        };
+        let user_transaction = || {
+            ArbSimulationTransaction::from_signed(
+                signed_1559(0, RECIPIENT, U256::from(123u64), Bytes::new())
+                    .try_into_recovered()
+                    .unwrap(),
+            )
+        };
+        let synthesized = execute_simulated_batch(
+            &config(),
+            database_with_l1_number(9),
+            &header(),
+            vec![user_transaction()],
+            ArbSimulationProgress::default(),
+            Some(block_start),
+            false,
+            ArbSimulationValidation::strict(),
+        )
+        .unwrap();
+        let start_transaction = create_internal_transaction(
+            CHAIN_ID,
+            &internal_tx::encode_start_block(
+                block_start.l1_base_fee,
+                block_start.l1_block_number,
+                header().number,
+                block_start.time_passed,
+            ),
+        );
+        let exact = execute_simulated_signed_block(
+            &config(),
+            database_with_l1_number(9),
+            &header(),
+            vec![
+                ArbSimulationTransaction::from_signed(
+                    start_transaction.try_into_recovered().unwrap(),
+                ),
+                user_transaction(),
+            ],
+            false,
+        )
+        .unwrap();
+
+        let mut synthesized_state = database_with_l1_number(9);
+        apply_bundle(&mut synthesized_state, &synthesized.bundle);
+        let mut exact_state = database_with_l1_number(9);
+        apply_bundle(&mut exact_state, &exact.bundle);
+        assert_same_cached_state(&synthesized_state, &exact_state);
+        assert_eq!(synthesized.progress, exact.progress);
+        let arb_state =
+            arbos::arbos_state::ArbosState::open(&mut exact_state, SystemBurner::new(None, false))
+                .unwrap();
+        // SAFETY: the detached test state has no concurrent borrower.
+        let backend = unsafe { arb_state.backing_storage.state_mut() };
+        assert_eq!(arb_state.blockhashes.l1_block_number(backend).unwrap(), 9);
+    }
+
+    #[test]
     fn relaxed_unsigned_call_executes_with_zero_fee_and_unfunded_caller() {
         let transaction = || {
             ArbSimulationTransaction::from_environment(
@@ -1223,6 +1344,111 @@ mod tests {
     }
 
     #[test]
+    fn relaxed_unsigned_commit_preserves_state_without_synthetic_fee_or_nonce_writes() {
+        let block_start = Some(ArbSimulationBlockStart {
+            l1_base_fee: U256::from(1_000_000_000u64),
+            l1_block_number: 9,
+            time_passed: 0,
+        });
+        let baseline = execute_simulated_batch(
+            &config(),
+            database(),
+            &header(),
+            Vec::new(),
+            ArbSimulationProgress::default(),
+            block_start,
+            true,
+            ArbSimulationValidation::relaxed(),
+        )
+        .unwrap();
+        let transaction = ArbSimulationTransaction::from_environment(
+            ArbTransaction(reth_revm::context::TxEnv {
+                caller: SENDER,
+                gas_limit: 500_000,
+                gas_price: HEADER_BASE_FEE as u128,
+                gas_priority_fee: Some(0),
+                kind: TxKind::Call(FEE_CONTEXT_CONTRACT),
+                chain_id: Some(CHAIN_ID),
+                ..Default::default()
+            }),
+            CHAIN_ID,
+        )
+        .unwrap();
+        let output = execute_simulated_transaction(
+            &config(),
+            database(),
+            &header(),
+            transaction,
+            ArbSimulationProgress::default(),
+            block_start,
+            true,
+            ArbSimulationValidation::relaxed(),
+        )
+        .unwrap();
+
+        let ExecutionResult::Success {
+            output: Output::Call(bytes),
+            ..
+        } = &output.result
+        else {
+            panic!("fee-context probe did not succeed: {:?}", output.result);
+        };
+        assert_eq!(bytes.len(), 64);
+        assert_eq!(
+            U256::from_be_slice(&bytes[..32]),
+            U256::from(HEADER_BASE_FEE)
+        );
+        // ArbOS drops the tip and exposes its current L2 pricing-state base fee
+        // through GASPRICE; the fixture bootstraps that value to 100m wei.
+        assert_eq!(
+            U256::from_be_slice(&bytes[32..]),
+            U256::from(100_000_000u64)
+        );
+
+        let mut baseline_state = database();
+        apply_bundle(&mut baseline_state, &baseline.bundle);
+        let mut probe_state = database();
+        apply_bundle(&mut probe_state, &output.bundle);
+        let addresses = baseline_state
+            .cache
+            .accounts
+            .keys()
+            .chain(probe_state.cache.accounts.keys())
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        for address in addresses {
+            if address == FEE_CONTEXT_CONTRACT {
+                continue;
+            }
+            let baseline_account = baseline_state
+                .cache
+                .accounts
+                .get(&address)
+                .and_then(|cached| cached.account.as_ref());
+            let probe_account = probe_state
+                .cache
+                .accounts
+                .get(&address)
+                .and_then(|cached| cached.account.as_ref());
+            assert_eq!(
+                baseline_account, probe_account,
+                "synthetic fee or nonce state changed at {address}"
+            );
+        }
+        let target = probe_state
+            .cache
+            .accounts
+            .get(&FEE_CONTEXT_CONTRACT)
+            .and_then(|cached| cached.account.as_ref())
+            .unwrap();
+        assert_eq!(target.storage.get(&U256::ZERO), Some(&U256::from(42u64)));
+        assert!(
+            output.progress.block_gas_left().unwrap() < baseline.progress.block_gas_left().unwrap()
+        );
+        assert_eq!(output.progress.user_txs_processed(), 1);
+    }
+
+    #[test]
     fn predicted_startblock_l1_number_matches_evm_number_context() {
         let mut target_header = header();
         target_header.mix_hash = arbos::header::compute_arbos_mixhash(0, 10, 61, false);
@@ -1273,7 +1499,7 @@ mod tests {
         .unwrap_err();
         assert!(mismatch
             .to_string()
-            .contains("does not match header mix-hash"));
+            .contains("exceeds monotonic header mix-hash"));
     }
 
     #[test]

@@ -181,6 +181,8 @@ impl<R, Spec, EvmF> ArbBlockExecutorFactory<R, Spec, EvmF> {
             simulation_disable_nonce_check: false,
             simulation_disable_base_fee_check: false,
             simulation_disable_balance_check: false,
+            simulation_disable_fee_charging: false,
+            simulation_sender_nonce_before: None,
         }
     }
 }
@@ -259,6 +261,8 @@ where
             simulation_disable_nonce_check: false,
             simulation_disable_base_fee_check: false,
             simulation_disable_balance_check: false,
+            simulation_disable_fee_charging: false,
+            simulation_sender_nonce_before: None,
         }
     }
 }
@@ -365,6 +369,15 @@ pub struct ArbBlockExecutor<'a, Evm, Spec, R: ReceiptBuilder> {
     simulation_disable_nonce_check: bool,
     simulation_disable_base_fee_check: bool,
     simulation_disable_balance_check: bool,
+    /// Suppress fee-account and pricing-state writes for unsigned estimate
+    /// transactions. Revm's matching cfg flag suppresses its caller debit and
+    /// beneficiary credit while leaving `BASEFEE`, `GASPRICE`, and gas usage
+    /// observable to the executing contract.
+    simulation_disable_fee_charging: bool,
+    /// Original nonce for the current synthetic user transaction. Revm still
+    /// increments nonce when validation is disabled, so estimate-mode commits
+    /// restore this field without disturbing the caller's other state changes.
+    simulation_sender_nonce_before: Option<(Address, u64)>,
 }
 
 /// Simulation lifecycle and cumulative in-block counters that are not stored
@@ -436,17 +449,19 @@ impl<'a, Evm, Spec, R: ReceiptBuilder> ArbBlockExecutor<'a, Evm, Spec, R> {
         self.multi_gas_sink = sink;
     }
 
-    /// Relax manual user-transaction checks for unsigned speculative calls.
-    /// Canonical and signed execution leave every override disabled.
+    /// Configure validation and fee-state overrides for unsigned speculative
+    /// calls. Canonical and signed execution leave every override disabled.
     pub fn set_simulation_validation_overrides(
         &mut self,
         disable_nonce_check: bool,
         disable_base_fee_check: bool,
         disable_balance_check: bool,
+        disable_fee_charging: bool,
     ) {
         self.simulation_disable_nonce_check = disable_nonce_check;
         self.simulation_disable_base_fee_check = disable_base_fee_check;
         self.simulation_disable_balance_check = disable_balance_check;
+        self.simulation_disable_fee_charging = disable_fee_charging;
     }
 
     /// Restore cumulative counters after block-start state has initialized a
@@ -1361,6 +1376,14 @@ where
         self.precompile_ctx.reset_tx();
         self.precompile_ctx.reset_caller_stack();
         self.state_overlay.reset_tx();
+        self.simulation_sender_nonce_before = None;
+        if self.simulation_disable_fee_charging && is_user_tx {
+            let sender_nonce = {
+                let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
+                db.basic(sender).ok().flatten().map_or(0, |info| info.nonce)
+            };
+            self.simulation_sender_nonce_before = Some((sender, sender_nonce));
+        }
         if let Some(hooks) = self.arb_hooks.as_mut() {
             hooks.tx_proc.poster_fee = U256::ZERO;
             hooks.tx_proc.poster_gas = 0;
@@ -1969,7 +1992,7 @@ where
             let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
             let arb_state = arbos_from_input_system(db, SystemBurner::new(None, false))
                 .map_err(BlockExecutionError::other)?;
-            if calldata_units > 0 {
+            if calldata_units > 0 && !self.simulation_disable_fee_charging {
                 // SAFETY: see `Storage::state_mut()` invariant.
                 let state_ref = &mut *db;
                 let _ = arb_state
@@ -2200,7 +2223,7 @@ where
                 this.precompile_ctx.reset_tx();
                 let overlay = &mut this.state_overlay;
                 let db = StateDbBackend::from_mut(this.inner.evm_mut().db_mut());
-                if units > 0 {
+                if units > 0 && !this.simulation_disable_fee_charging {
                     let arb_state = arbos_from_input_system(db, SystemBurner::new(None, false))
                         .map_err(BlockExecutionError::other)?;
                     // SAFETY: see `Storage::state_mut()` invariant.
@@ -2327,6 +2350,15 @@ where
             }
         };
 
+        // `disable_nonce_check` only relaxes validation; revm still increments
+        // the transaction origin. Estimate-mode transactions must retain any
+        // real storage/value effects while leaving this synthetic nonce alone.
+        if let Some((address, nonce)) = self.simulation_sender_nonce_before {
+            if let Some(account) = output.result.state.get_mut(&address) {
+                account.info.nonce = nonce;
+            }
+        }
+
         // Capture gas_used as reported by reth's EVM (before our adjustments).
         // This represents the gas cost reth already deducted from the sender.
         let evm_gas_used = output.result.result.tx_gas_used();
@@ -2429,11 +2461,13 @@ where
                         }
                     }
 
-                    let _ = arb_state.l2_pricing_state.shrink_backlog(
-                        state_ref,
-                        donated_gas,
-                        MultiGas::default(),
-                    );
+                    if !self.simulation_disable_fee_charging {
+                        let _ = arb_state.l2_pricing_state.shrink_backlog(
+                            state_ref,
+                            donated_gas,
+                            MultiGas::default(),
+                        );
+                    }
                     let backlog = arb_state.l2_pricing_state.gas_backlog(state_ref).ok();
                     (encoded_retry_tx, backlog)
                 };
@@ -2604,6 +2638,21 @@ where
             let gas_output = self.inner.commit_transaction(output);
             let gas_used = gas_output.tx_gas_used();
 
+            // Early-return ArbOS paths can update nonce directly in the state
+            // backend instead of returning it in `ResultAndState`. Restore the
+            // captured value after every synthetic commit as a final guard.
+            if let Some((address, nonce)) = self.simulation_sender_nonce_before.take() {
+                let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
+                if let Ok(current) = db.basic(address) {
+                    if let Some(mut next) = current.clone() {
+                        if next.nonce != nonce {
+                            next.nonce = nonce;
+                            commit_account_info(db, address, current, next, false);
+                        }
+                    }
+                }
+            }
+
             // An owner setter flags a per-tx state-parameter change; refresh the
             // cached values so it takes effect within the block, including the
             // setting transaction's own subsequent accounting.
@@ -2620,25 +2669,27 @@ where
             // CollectTips is on. tx_env.gas_limit is shrunk by poster_gas before
             // revm, so revm only minted `tip * compute_gas` to coinbase — that's
             // the amount to transfer. tip × posterGas is burned implicitly.
-            if let Some(ref p) = pending {
-                if !p.capped_gas_price && p.coinbase_tip_per_gas > 0 && gas_used > 0 {
-                    let coinbase = self.arb_ctx.coinbase;
-                    let net_acct = self.arb_ctx.network_fee_account;
-                    let compute_gas = gas_used.saturating_sub(p.poster_gas);
-                    let tip_to_network =
-                        U256::from(p.coinbase_tip_per_gas).saturating_mul(U256::from(compute_gas));
-                    if coinbase != net_acct && !tip_to_network.is_zero() {
-                        let overlay = &mut self.state_overlay;
-                        let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
-                        if get_balance(db, coinbase) >= tip_to_network {
-                            let _ = arb_util::transfer_balance(
-                                Some(&coinbase),
-                                Some(&net_acct),
-                                tip_to_network,
-                                |f, t, a| apply_balance_op(db, overlay, f, t, a),
-                            );
-                            self.touched_accounts.insert(coinbase);
-                            self.touched_accounts.insert(net_acct);
+            if !self.simulation_disable_fee_charging {
+                if let Some(ref p) = pending {
+                    if !p.capped_gas_price && p.coinbase_tip_per_gas > 0 && gas_used > 0 {
+                        let coinbase = self.arb_ctx.coinbase;
+                        let net_acct = self.arb_ctx.network_fee_account;
+                        let compute_gas = gas_used.saturating_sub(p.poster_gas);
+                        let tip_to_network = U256::from(p.coinbase_tip_per_gas)
+                            .saturating_mul(U256::from(compute_gas));
+                        if coinbase != net_acct && !tip_to_network.is_zero() {
+                            let overlay = &mut self.state_overlay;
+                            let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
+                            if get_balance(db, coinbase) >= tip_to_network {
+                                let _ = arb_util::transfer_balance(
+                                    Some(&coinbase),
+                                    Some(&net_acct),
+                                    tip_to_network,
+                                    |f, t, a| apply_balance_op(db, overlay, f, t, a),
+                                );
+                                self.touched_accounts.insert(coinbase);
+                                self.touched_accounts.insert(net_acct);
+                            }
                         }
                     }
                 }
@@ -2646,21 +2697,23 @@ where
 
             // Stylus activation data fee: sender → network (via cache, post-commit).
             // Value was zeroed in tx_env so sender still has the ETH.
-            if let Some(ref p) = pending {
-                if !p.stylus_data_fee.is_zero() {
-                    let overlay = &mut self.state_overlay;
-                    let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
-                    let _ = arb_util::burn_balance(&p.sender, p.stylus_data_fee, |f, t, a| {
-                        apply_balance_op(db, overlay, f, t, a)
-                    });
-                    let _ = arb_util::mint_balance(
-                        &self.arb_ctx.network_fee_account,
-                        p.stylus_data_fee,
-                        |f, t, a| apply_balance_op(db, overlay, f, t, a),
-                    );
-                    self.touched_accounts.insert(p.sender);
-                    self.touched_accounts
-                        .insert(self.arb_ctx.network_fee_account);
+            if !self.simulation_disable_fee_charging {
+                if let Some(ref p) = pending {
+                    if !p.stylus_data_fee.is_zero() {
+                        let overlay = &mut self.state_overlay;
+                        let db = StateDbBackend::from_mut(self.inner.evm_mut().db_mut());
+                        let _ = arb_util::burn_balance(&p.sender, p.stylus_data_fee, |f, t, a| {
+                            apply_balance_op(db, overlay, f, t, a)
+                        });
+                        let _ = arb_util::mint_balance(
+                            &self.arb_ctx.network_fee_account,
+                            p.stylus_data_fee,
+                            |f, t, a| apply_balance_op(db, overlay, f, t, a),
+                        );
+                        self.touched_accounts.insert(p.sender);
+                        self.touched_accounts
+                            .insert(self.arb_ctx.network_fee_account);
+                    }
                 }
             }
 
@@ -2746,7 +2799,7 @@ where
                 // actual_gas_price so `tip * posterGas` gets burned here (revm
                 // never minted it to coinbase, since we shrunk gas_limit first).
                 let sender_extra_gas = gas_used_total.saturating_sub(pending.evm_gas_used);
-                if sender_extra_gas > 0 {
+                if sender_extra_gas > 0 && !self.simulation_disable_fee_charging {
                     let extra_cost = pending
                         .actual_gas_price
                         .saturating_mul(U256::from(sender_extra_gas));
@@ -2983,12 +3036,14 @@ where
                             self.precompile_ctx.block.set_current_gas_backlog(b);
                         }
                     }
-                } else if matches!(
-                    pending.arb_tx_type,
-                    None | Some(ArbTxType::ArbitrumLegacyTx)
-                        | Some(ArbTxType::ArbitrumUnsignedTx)
-                        | Some(ArbTxType::ArbitrumContractTx)
-                ) {
+                } else if !self.simulation_disable_fee_charging
+                    && matches!(
+                        pending.arb_tx_type,
+                        None | Some(ArbTxType::ArbitrumLegacyTx)
+                            | Some(ArbTxType::ArbitrumUnsignedTx)
+                            | Some(ArbTxType::ArbitrumContractTx)
+                    )
+                {
                     // Normal tx fee distribution: standard EOA-signed txs, plus
                     // UnsignedTx/ContractTx (L1->L2 messages that pass through normal
                     // EVM gas charging). Poster cost is zero for the latter two.
